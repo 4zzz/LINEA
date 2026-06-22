@@ -1,3 +1,5 @@
+dataset_name = 'coco'
+
 data_aug_scales = [(640, 640)]
 data_aug_max_size = 1333
 data_aug_scales2_resize = [400, 500, 600]
