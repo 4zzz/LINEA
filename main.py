@@ -3,7 +3,10 @@
 import argparse
 import datetime
 import json
+import platform
 import random
+import subprocess
+import sys
 import time
 from pathlib import Path
 from collections import Counter
@@ -23,6 +26,7 @@ from engine import train_one_epoch, evaluate, test
 
 from tensorboardX import SummaryWriter
 from warmup import LinearWarmup
+
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
@@ -60,6 +64,194 @@ def get_args_parser():
     return parser
 
 
+def _json_safe(value):
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return str(value)
+
+
+def _git_metadata():
+    metadata = {}
+    commands = {
+        'commit': ['git', 'rev-parse', 'HEAD'],
+        'branch': ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+        'status_short': ['git', 'status', '--short'],
+        'diff_head_binary': ['git', 'diff', 'HEAD', '--binary'],
+    }
+    for key, command in commands.items():
+        try:
+            metadata[key] = subprocess.check_output(
+                command,
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        except Exception:
+            metadata[key] = None
+    metadata['untracked_files'] = []
+    metadata['untracked_diff_binary'] = None
+    try:
+        untracked_output = subprocess.check_output(
+            ['git', 'ls-files', '--others', '--exclude-standard'],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        untracked_files = [line for line in untracked_output.splitlines() if line]
+        metadata['untracked_files'] = untracked_files
+        patches = []
+        for path in untracked_files:
+            try:
+                patch = subprocess.run(
+                    ['git', 'diff', '--no-index', '--binary', '/dev/null', path],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                ).stdout
+                if patch:
+                    patches.append(patch)
+            except Exception:
+                patches.append(f'# Could not diff untracked file: {path}\n')
+        metadata['untracked_diff_binary'] = ''.join(patches)
+    except Exception:
+        pass
+    return metadata
+
+
+def _proc_meminfo():
+    meminfo_path = Path('/proc/meminfo')
+    if not meminfo_path.exists():
+        return None
+    meminfo = {}
+    try:
+        with meminfo_path.open() as f:
+            for line in f:
+                key, value = line.split(':', 1)
+                meminfo[key] = value.strip()
+    except Exception:
+        return None
+    return meminfo
+
+
+def _cuda_devices():
+    cuda = {
+        'is_available': torch.cuda.is_available(),
+        'device_count': torch.cuda.device_count(),
+        'devices': [],
+    }
+    for index in range(torch.cuda.device_count()):
+        try:
+            props = torch.cuda.get_device_properties(index)
+            cuda['devices'].append({
+                'index': index,
+                'name': props.name,
+                'total_memory_bytes': props.total_memory,
+                'major': props.major,
+                'minor': props.minor,
+                'multi_processor_count': props.multi_processor_count,
+            })
+        except Exception as exc:
+            cuda['devices'].append({
+                'index': index,
+                'error': str(exc),
+            })
+    return cuda
+
+
+def _nvidia_smi():
+    try:
+        return subprocess.check_output(
+            [
+                'nvidia-smi',
+                '--query-gpu=index,name,uuid,memory.total,driver_version',
+                '--format=csv,noheader',
+            ],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return None
+
+
+def _selected_environment():
+    prefixes = ('SLURM_',)
+    names = {
+        'CUDA_VISIBLE_DEVICES',
+        'NVIDIA_VISIBLE_DEVICES',
+        'LOCAL_RANK',
+        'RANK',
+        'WORLD_SIZE',
+        'MASTER_ADDR',
+        'MASTER_PORT',
+        'HOSTNAME',
+    }
+    return {
+        key: value
+        for key, value in sorted(os.environ.items())
+        if key in names or any(key.startswith(prefix) for prefix in prefixes)
+    }
+
+
+def _machine_metadata():
+    return {
+        'hostname': platform.node(),
+        'platform': platform.platform(),
+        'system': platform.system(),
+        'release': platform.release(),
+        'version': platform.version(),
+        'machine': platform.machine(),
+        'processor': platform.processor(),
+        'cpu_count': os.cpu_count(),
+        'meminfo': _proc_meminfo(),
+        'cuda': _cuda_devices(),
+        'nvidia_smi': _nvidia_smi(),
+        'environment': _selected_environment(),
+    }
+
+
+def save_run_metadata(args):
+    if not getattr(args, 'output_dir', None) or not utils.is_main_process():
+        return
+
+    output_dir = Path(args.output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    cmdline = {
+        'argv': sys.argv,
+        'cwd': os.getcwd(),
+    }
+    with open(output_dir / 'cmdline.json', 'w') as f:
+        json.dump(cmdline, f, indent=2)
+
+    effective_config = {
+        'args': _json_safe(vars(args)),
+        'effective_seed': args.seed + utils.get_rank() if hasattr(args, 'seed') else None,
+        'python': sys.version,
+        'torch': {
+            'version': torch.__version__,
+            'cuda': torch.version.cuda,
+            'cudnn': torch.backends.cudnn.version(),
+        },
+    }
+    with open(output_dir / 'effective_config.json', 'w') as f:
+        json.dump(effective_config, f, indent=2, sort_keys=True)
+
+    with open(output_dir / 'codebase.json', 'w') as f:
+        json.dump(_git_metadata(), f, indent=2, sort_keys=True)
+
+    with open(output_dir / 'machine.json', 'w') as f:
+        json.dump(_machine_metadata(), f, indent=2, sort_keys=True)
+
+
 def create(args, classname):
     # we use register to maintain models from catdet6 on.
     from models.registry import MODULE_BUILD_FUNCS
@@ -84,6 +276,7 @@ def main(args):
             setattr(args, k, v)
         else:
             raise ValueError("Key {} can used by args only".format(k))
+
     # setup tensorboar writer
     if not args.eval:
         writer = SummaryWriter(args.output_dir)
@@ -99,6 +292,7 @@ def main(args):
         args.eval_spatial_size = [size, size]
 
     assert args.eval_spatial_size[0] == args.eval_spatial_size[1], 'We only support square shapes'
+    save_run_metadata(args)
     device = torch.device(args.device)
 
     print(args)
