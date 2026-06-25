@@ -450,8 +450,13 @@ class LINEATransformer(nn.Module):
             output_proposals = output_proposals.to(memory.device).repeat(bs, 1, 1)
             output_memory = memory.masked_fill(~output_proposals_valid.to(memory.device), float(0))
         else:
-            output_proposals = self.output_proposals.repeat(bs, 1, 1)
-            output_memory = memory.masked_fill(self.output_proposals_mask, float(0))
+            if hasattr(self, 'output_proposals') and hasattr(self, 'output_proposals_mask'):
+                output_proposals = self.output_proposals.repeat(bs, 1, 1)
+                output_memory = memory.masked_fill(self.output_proposals_mask, float(0))
+            else:
+                output_proposals, output_proposals_valid = self.generate_anchors(spatial_shapes)
+                output_proposals = output_proposals.to(memory.device).repeat(bs, 1, 1)
+                output_memory = memory.masked_fill(~output_proposals_valid.to(memory.device), float(0))
 
         output_memory = self.enc_output_norm(self.enc_output(output_memory))
 
@@ -566,5 +571,4 @@ def build_decoder(args):
             dn_label_noise_ratio=args.dn_label_noise_ratio,
             dn_line_noise_scale=args.dn_line_noise_scale,
             )
-
 

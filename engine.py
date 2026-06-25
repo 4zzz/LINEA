@@ -11,6 +11,10 @@ import torch
 import util.misc as utils
 
 
+def _move_targets_to_device(targets, device):
+    return [{k: v.to(device) for k, v in t.items() if torch.is_tensor(v)} for t in targets]
+
+
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0, writer=None,
@@ -26,7 +30,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     for i, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
 
         samples = samples.to(device)
-        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        targets = _move_targets_to_device(targets, device)
 
         global_step = epoch * len(data_loader) + i
 
@@ -99,9 +103,11 @@ def evaluate(model, criterion, postprocessors, data_loader, device, output_dir, 
 
     for samples, targets in metric_logger.log_every(data_loader, 250, header):
         samples = samples.to(device)
-        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        targets = _move_targets_to_device(targets, device)
 
-        with torch.amp.autocast(str(device), enabled=args.amp):
+        # Validation can overflow in autocast even when the checkpoint is finite;
+        # keep training AMP enabled but compute validation loss in FP32.
+        with torch.amp.autocast(str(device), enabled=False):
             outputs = model(samples, targets)
 
             loss_dict = criterion(outputs, targets)
@@ -132,7 +138,7 @@ def test(model, criterion, postprocessors, evaluator, data_loader, device, outpu
 
     for samples, targets in metric_logger.log_every(data_loader, 250, header):
         samples = samples.to(device)
-        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        targets = _move_targets_to_device(targets, device)
 
         outputs = model(samples, targets)
 

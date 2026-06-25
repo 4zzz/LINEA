@@ -287,11 +287,12 @@ def main(args):
             args.pretrained = False
 
     # setup eval_spatial_size
-    if isinstance(args.eval_spatial_size, int):
-        size = args.eval_spatial_size 
+    if args.eval_spatial_size is not None and isinstance(args.eval_spatial_size, int):
+        size = args.eval_spatial_size
         args.eval_spatial_size = [size, size]
 
-    assert args.eval_spatial_size[0] == args.eval_spatial_size[1], 'We only support square shapes'
+    if args.eval_spatial_size is not None and hasattr(args.eval_spatial_size, "__len__") and len(args.eval_spatial_size) == 2:
+        assert args.eval_spatial_size[0] == args.eval_spatial_size[1], 'We only support square shapes'
     save_run_metadata(args)
     device = torch.device(args.device)
 
@@ -335,18 +336,25 @@ def main(args):
             sampler_train = torch.utils.data.RandomSampler(dataset_train)
             sampler_val = torch.utils.data.SequentialSampler(dataset_val)
         
+        if hasattr(args.eval_spatial_size, '__len__'):
+            collate_fn_train = BatchImageCollateFunction(base_size=args.eval_spatial_size[0], base_size_repeat=3)
+            collate_fn_val = BatchImageCollateFunction(base_size=args.eval_spatial_size[0])
+        else:
+            collate_fn_train = BatchImageCollateFunction()
+            collate_fn_val = BatchImageCollateFunction()
+
         data_loader_train = DataLoader(dataset_train, 
                                         args.batch_size_train, 
                                         sampler=sampler_train, 
                                         drop_last=True,
-                                        collate_fn=BatchImageCollateFunction(base_size=args.eval_spatial_size[0], base_size_repeat=3), 
+                                        collate_fn=collate_fn_train,
                                         # pin_memory=dataset_train.pin_memory,
                                         num_workers=args.num_workers)
         data_loader_val = DataLoader(dataset_val, 
                                         args.batch_size_val, 
                                         sampler=sampler_val, 
                                         drop_last=False,
-                                        collate_fn=BatchImageCollateFunction(base_size=args.eval_spatial_size[0]), 
+                                        collate_fn=collate_fn_val,
                                         # pin_memory=dataset_val.pin_memory,
                                         num_workers=args.num_workers)
 
@@ -386,7 +394,10 @@ def main(args):
                         data_loader_val, device, args.output_dir, args=args)
         return
 
-    print(stats(model_without_ddp, args))
+    try:
+        print(stats(model_without_ddp, args))
+    except Exception as exc:
+        print(f"Profiler skipped: {exc}")
 
     print("-"*41 + " Start training " + "-"*42)
     start_time = time.time()
