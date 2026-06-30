@@ -98,7 +98,12 @@ class PostProcess(nn.Module):
 def build_linea(args):
     num_classes = args.num_classes
 
-    backbone = build_hgnetv2(args)
+    if args.backbone == 'mogev2bb':
+        from .mogev2_backbone import build_mogev2_backbone
+        backbone = build_mogev2_backbone(args)
+    else:
+        backbone = build_hgnetv2(args)
+
     encoder = build_hybrid_encoder(args)
     decoder = build_decoder(args)
 
