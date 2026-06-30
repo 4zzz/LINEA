@@ -408,7 +408,7 @@ class ColorJitter(object):
 
 
 class Normalize(object):
-    def __init__(self, mean, std):
+    def __init__(self, mean, std, normalize_lines=True):
         self.mean = mean
         self.std = std
 

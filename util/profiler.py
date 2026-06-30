@@ -6,8 +6,9 @@ def stats(
     model, args,
     input_shape: Tuple=(1, 3, 640, 640), ) -> Tuple[int, dict]:
 
-    base_size = args.eval_spatial_size[0]
-    input_shape = (1, 3, base_size, base_size)
+    if hasattr(args.eval_spatial_size, '__len__'):
+        base_size = args.eval_spatial_size[0]
+        input_shape = (1, 3, base_size, base_size)
 
     model_for_info = copy.deepcopy(model).deploy()
 

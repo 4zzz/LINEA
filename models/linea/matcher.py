@@ -82,7 +82,35 @@ class HungarianMatcher(nn.Module):
         cost_line = torch.cdist(out_line, tgt_line, p=1)
 
         # Final cost matrix
-        C = self.cost_line * cost_line + self.cost_class * cost_class 
+        C = self.cost_line * cost_line + self.cost_class * cost_class
+        if not torch.isfinite(C).all():
+            def finite_summary(name, tensor):
+                finite = torch.isfinite(tensor)
+                if finite.any():
+                    valid = tensor[finite]
+                    return (
+                        f"{name}: finite={finite.sum().item()}/{tensor.numel()} "
+                        f"min={valid.min().item():.6g} max={valid.max().item():.6g}"
+                    )
+                return f"{name}: finite=0/{tensor.numel()}"
+
+            image_ids = [
+                v.get("image_id", torch.tensor([-1])).detach().cpu().flatten().tolist()
+                for v in targets
+            ]
+            raise ValueError(
+                "matcher cost matrix contains non-finite values; "
+                + "; ".join([
+                    finite_summary("pred_logits", outputs["pred_logits"]),
+                    finite_summary("pred_lines", outputs["pred_lines"]),
+                    finite_summary("target_lines", tgt_line),
+                    finite_summary("cost_class", cost_class),
+                    finite_summary("cost_line", cost_line),
+                    finite_summary("cost", C),
+                    f"target_sizes={[len(v['lines']) for v in targets]}",
+                    f"image_ids={image_ids}",
+                ])
+            )
         C = C.view(bs, num_queries, -1).cpu()
 
         sizes = [len(v["lines"]) for v in targets]

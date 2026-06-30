@@ -350,6 +350,8 @@ class Monolines3D(torch.utils.data.Dataset):
 
         target = {k: torch.from_numpy(v) for k, v in target.items()}
 
+        target['image_path'] = entry['image_path']
+
         if self.transforms is not None:
             #img = Image.fromarray(img*255)
             img, target = self.transforms(img, target)
@@ -394,22 +396,34 @@ class Monolines3D(torch.utils.data.Dataset):
 
 
 def make_coco_transforms(image_set, args=None):
-
-    normalize = T.Compose([
+    ts = [
         T.ToTensor(),
-        T.Normalize([0.538, 0.494, 0.453], [0.257, 0.263, 0.273])
-    ])
+    ]
+    normalize_lines = args.mono3d_use_image_normalized_target_line_coords
+    if args.mono3d_do_not_normalize_images is False:
+        ts.append(T.Normalize([0.538, 0.494, 0.453], [0.257, 0.263, 0.273], normalize_lines=normalize_lines))
+    else:
+
+        ts.append(T.Normalize([0.0, 0.0, 0.0], [1.0, 1.0, 1.0], normalize_lines=normalize_lines))
+    normalize = T.Compose(ts)
+
+
 
     # update args from config files
     scales = args.data_aug_scales
-    max_size = args.data_aug_max_size
-    scales2_resize = args.data_aug_scales2_resize
-    scales2_crop = args.data_aug_scales2_crop
-    test_size = args.eval_spatial_size
+    #max_size = args.data_aug_max_size
+    #scales2_resize = args.data_aug_scales2_resize
+    #scales2_crop = args.data_aug_scales2_crop
+    #test_size = args.eval_spatial_size
 
     if image_set == 'train':
-        return T.Compose([T.RandomResize(scales, max_size=max_size), normalize])
-        return normalize
+        if scales is None:
+            return normalize
+        else:
+
+            max_size = args.data_aug_max_size
+            return T.Compose([T.RandomResize(scales, max_size=max_size), normalize])
+
         return T.Compose([
             T.RandomSelect(
                     T.RandomHorizontalFlip(),
@@ -428,10 +442,14 @@ def make_coco_transforms(image_set, args=None):
         ])
 
     if image_set in ['val', 'test']:
-        return T.Compose([
-            T.RandomResize([test_size], max_size=max_size),
-            normalize,
-        ])
+        test_size = args.eval_spatial_size
+        if test_size is None:
+            return normalize
+        else:
+            return T.Compose([
+                T.RandomResize([test_size], max_size=max_size),
+                normalize,
+            ])
 
 
 

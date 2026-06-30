@@ -25,7 +25,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
-    print_freq = 500
+    print_freq = args.print_freq
     
     for i, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
 
@@ -100,8 +100,8 @@ def evaluate(model, criterion, postprocessors, data_loader, device, output_dir, 
     metric_logger = utils.MetricLogger(delimiter="  ")
    
     header = 'Test:'
-
-    for samples, targets in metric_logger.log_every(data_loader, 250, header):
+    print_freq = args.print_freq
+    for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
         samples = samples.to(device)
         targets = _move_targets_to_device(targets, device)
 

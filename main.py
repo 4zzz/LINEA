@@ -60,6 +60,7 @@ def get_args_parser():
     parser.add_argument("--local_rank", type=int, help='local rank for DistributedDataParallel')
     parser.add_argument('--amp', action='store_true',
                         help="Train with mixed precision")
+    parser.add_argument('--print_freq', default=500, type=int, help='number of distributed processes')
 
     return parser
 
@@ -394,10 +395,10 @@ def main(args):
                         data_loader_val, device, args.output_dir, args=args)
         return
 
-    try:
-        print(stats(model_without_ddp, args))
-    except Exception as exc:
-        print(f"Profiler skipped: {exc}")
+    #try:
+    #    print(stats(model_without_ddp, args))
+    #except Exception as exc:
+    #    print(f"Profiler skipped: {exc}")
 
     print("-"*41 + " Start training " + "-"*42)
     start_time = time.time()
