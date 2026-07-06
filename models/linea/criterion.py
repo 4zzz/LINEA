@@ -14,6 +14,7 @@ import os, sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 from util.misc import get_world_size, is_dist_avail_and_initialized
 
+from .moge.utils.alignment import align_points_scale_xyz_shift, align_points_scale_z_shift
 
 class LINEACriterion(nn.Module):
     """ This class computes the loss for Conditional DETR.
@@ -21,7 +22,7 @@ class LINEACriterion(nn.Module):
         1) we compute hungarian assignment between ground truth boxes and the outputs of the model
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
-    def __init__(self, num_classes, matcher, weight_dict, focal_alpha, losses):
+    def __init__(self, num_classes, matcher, weight_dict, focal_alpha, losses, line3d_alignment='xyz_shift'):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -36,6 +37,7 @@ class LINEACriterion(nn.Module):
         self.weight_dict = weight_dict
         self.losses = losses
         self.focal_alpha = focal_alpha
+        self.line3d_alignment = line3d_alignment
 
     def loss_labels(self, outputs, targets, indices, num_boxes):
         """Classification loss (Binary focal loss)
@@ -76,6 +78,64 @@ class LINEACriterion(nn.Module):
 
         return losses
 
+    def loss_lines3d(self, outputs, targets, indices, num_boxes):
+        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
+           targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
+           The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
+        """
+        assert 'pred_lines3d' in outputs
+
+        losses_per_image = []
+
+        for batch_i, ((src_idx, tgt_idx), target) in enumerate(zip(indices, targets)):
+            if len(src_idx) == 0:
+                continue
+
+            src_lines3d = outputs['pred_lines3d'][batch_i, src_idx]   # [M, 6]
+            tgt_lines3d = target['lines3d'][tgt_idx]
+
+            # [M, 2, 3]
+            src_pts = src_lines3d.view(-1, 2, 3)
+            tgt_pts = tgt_lines3d.view(-1, 2, 3)
+
+            # Endpoint-order invariance
+            tgt_pts_swapped = tgt_pts[:, [1, 0], :]
+
+            loss_direct = self._aligned_lines3d_loss(src_pts, tgt_pts)
+            loss_swapped = self._aligned_lines3d_loss(src_pts, tgt_pts_swapped)
+
+            losses_per_image.append(torch.minimum(loss_direct, loss_swapped))
+
+        if len(losses_per_image) == 0:
+            return {'loss_line3d': outputs['pred_lines3d'].sum() * 0.0}
+
+        loss_line3d = torch.stack(losses_per_image).sum() / num_boxes
+        return {'loss_line3d': loss_line3d}
+
+    def _aligned_lines3d_loss(self, src_pts, tgt_pts):
+        # src_pts, tgt_pts: [M, 2, 3]
+
+        src_pts_flat = src_pts.reshape(1, -1, 3)   # [1, 2M, 3]
+        tgt_pts_flat = tgt_pts.reshape(1, -1, 3)   # [1, 2M, 3]
+
+        weight = torch.ones(
+            src_pts_flat.shape[:2],
+            dtype=src_pts_flat.dtype,
+            device=src_pts_flat.device,
+        )
+
+        if self.line3d_alignment == 'xyz_shift':
+            scale, shift = align_points_scale_xyz_shift(src_pts_flat, tgt_pts_flat, weight)
+        elif self.line3d_alignment == 'z_shift':
+            scale, shift = align_points_scale_z_shift(src_pts_flat, tgt_pts_flat, weight)
+        else:
+            raise ValueError(f"Unknown line3d_alignment value '{self.line3d_alignment}'.")
+
+        src_aligned = scale[:, None, None] * src_pts_flat + shift[:, None, :]
+        loss = F.l1_loss(src_aligned, tgt_pts_flat, reduction='none')
+
+        return loss.sum()
+
     def loss_lmap(self, outputs, targets, indices, num_boxes):
         losses = {}
         if 'aux_lmap' in outputs:
@@ -114,6 +174,7 @@ class LINEACriterion(nn.Module):
         loss_map = {
             'labels': self.loss_labels,
             'lines': self.loss_lines,
+            'lines3d': self.loss_lines3d,
             'lmap': self.loss_lmap,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
@@ -504,8 +565,14 @@ def build_criterion(args):
     matcher = build_matcher(args)
 
     if args.criterion_type == 'default':
-        criterion = LINEACriterion(num_classes, matcher=matcher, weight_dict=args.weight_dict,
-                             focal_alpha=args.focal_alpha, losses=args.losses)
+        criterion = LINEACriterion(
+            num_classes, 
+            matcher=matcher, 
+            weight_dict=args.weight_dict,
+            focal_alpha=args.focal_alpha, 
+            losses=args.losses, 
+            line3d_alignment=getattr(args, 'line3d_alignment', 'xyz_shift')
+        )
     elif args.criterion_type == 'dfine':
         criterion = DFINESetCriterion(num_classes, matcher=matcher, weight_dict=args.weight_dict,
                              focal_alpha=args.focal_alpha, reg_max=args.reg_max, losses=args.losses)

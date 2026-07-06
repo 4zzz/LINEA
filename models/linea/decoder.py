@@ -158,10 +158,10 @@ class LQE(nn.Module):
 
 class TransformerDecoder(nn.Module):
     def __init__(
-    	self, 
-    	decoder_layer, 
-    	num_layers, 
-    	norm=None, 
+        self,
+        decoder_layer,
+        num_layers,
+        norm=None,
         d_model=256, 
         query_dim=4, 
         num_feature_levels=1,
@@ -170,6 +170,7 @@ class TransformerDecoder(nn.Module):
         # from D-FINE
         reg_max=32,
         reg_scale=4,
+        pred_3d=False,
         ):
         super().__init__()
         if num_layers > 0:
@@ -205,6 +206,13 @@ class TransformerDecoder(nn.Module):
         self.lqe_layers = nn.ModuleList([copy.deepcopy(LQE(4, 64, 2, reg_max)) for _ in range(num_layers)])
         self.integral = Integral(self.reg_max)
 
+        self.pred_3d = pred_3d
+        if self.pred_3d:
+            _line3d_embed = MLP(d_model, d_model, 6, 3)
+            nn.init.constant_(_line3d_embed.layers[-1].weight.data, 0)
+            nn.init.constant_(_line3d_embed.layers[-1].bias.data, 0)
+            self.line3d_embed = nn.ModuleList([copy.deepcopy(_line3d_embed) for _ in range(num_layers)])
+
         self.aux_loss = aux_loss
 
         # inference
@@ -237,8 +245,8 @@ class TransformerDecoder(nn.Module):
         self.project = weighting_function(self.reg_max, self.up, self.reg_scale, deploy=True)
 
     def forward(self, 
-    	tgt, 
-    	memory,
+        tgt, 
+        memory,
         tgt_mask: Optional[Tensor] = None,
         memory_mask: Optional[Tensor] = None,
         tgt_key_padding_mask: Optional[Tensor] = None,
@@ -264,6 +272,7 @@ class TransformerDecoder(nn.Module):
         ref_points_initial = ref_points_detach
 
         dec_out_bboxes = []
+        dec_out_lines3d = []
         dec_out_logits = []
 
         if not hasattr(self, 'project'):
@@ -296,19 +305,27 @@ class TransformerDecoder(nn.Module):
             pred_corners = self.bbox_embed[layer_id](output + output_detach) + pred_corners_undetach
             inter_ref_bbox = distance2bbox(ref_points_initial, self.integral(pred_corners, project), self.reg_scale) 
 
+            if self.pred_3d:
+                pred_line3d = self.line3d_embed[layer_id](output)
+
             if self.training or layer_id == self.eval_idx:
-            	scores = self.class_embed[layer_id](output)
-            	scores = self.lqe_layers[layer_id](scores, pred_corners)
-            	dec_out_logits.append(scores)
-            	dec_out_bboxes.append(inter_ref_bbox)
+                scores = self.class_embed[layer_id](output)
+                scores = self.lqe_layers[layer_id](scores, pred_corners)
+                dec_out_logits.append(scores)
+                dec_out_bboxes.append(inter_ref_bbox)
+                if self.pred_3d:
+                    dec_out_lines3d.append(pred_line3d)
 
             pred_corners_undetach = pred_corners
             if self.training:
-            	ref_points_detach = inter_ref_bbox.detach() 
-            	output_detach = output.detach()
+                ref_points_detach = inter_ref_bbox.detach() 
+                output_detach = output.detach()
             else:
-            	ref_points_detach = inter_ref_bbox
-            	output_detach = output
+                ref_points_detach = inter_ref_bbox
+                output_detach = output
+
+        if self.pred_3d:
+            return torch.stack(dec_out_bboxes).permute(0, 2, 1, 3), torch.stack(dec_out_logits).permute(0, 2, 1, 3), torch.stack(dec_out_lines3d).permute(0, 2, 1, 3)
 
         return torch.stack(dec_out_bboxes).permute(0, 2, 1, 3), torch.stack(dec_out_logits).permute(0, 2, 1, 3), 
 
@@ -340,7 +357,8 @@ class LINEATransformer(nn.Module):
         dn_line_noise_scale=0.5,
         # for inference
         eval_spatial_size=None,
-        eval_idx=5
+        eval_idx=5,
+        pred_3d = False,
         ):
         super().__init__()
 
@@ -381,7 +399,15 @@ class LINEATransformer(nn.Module):
                                         d_model=d_model, query_dim=query_dim, 
                                         num_feature_levels=num_feature_levels, 
                                         eval_idx=eval_idx, aux_loss=aux_loss,
-                                        reg_max=reg_max, reg_scale=reg_scale)
+                                        reg_max=reg_max, reg_scale=reg_scale,
+                                        pred_3d=pred_3d)
+
+        self.pred_3d = pred_3d
+        if self.pred_3d:
+            _line3d_embed = MLP(d_model, d_model, 6, 3)
+            nn.init.constant_(_line3d_embed.layers[-1].weight.data, 0)
+            nn.init.constant_(_line3d_embed.layers[-1].bias.data, 0)
+            self.enc_out_line3d_embed = copy.deepcopy(_line3d_embed)
 
         # for inference mode
         self.eval_spatial_size = eval_spatial_size
@@ -470,6 +496,9 @@ class LINEATransformer(nn.Module):
         refpoint_embed_undetach = self.enc_out_bbox_embed(selected_output_memory) + selected_output_proposals # (bs, \sum{hw}, 4) unsigmoid
         refpoint_embed = refpoint_embed_undetach.detach()
 
+        if self.pred_3d is True and self.training is True:
+            out_lines3d_enc = self.enc_out_line3d_embed(selected_output_memory)
+
         # gather tgt
         tgt_undetach = torch.gather(output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, self.d_model)) if self.training else None
         tgt = self.tgt_embed.weight[:, None, :].repeat(1, bs, 1)  # nq, bs, d_model
@@ -488,48 +517,77 @@ class LINEATransformer(nn.Module):
         # preprocess memory for MSDeformableLineAttention
         value = memory.unflatten(2, (self.n_heads, -1)) # (bs, \sum{hxw}, n_heads, d_model//n_heads)
         value = value.permute(0, 2, 3, 1).flatten(0, 1).split(split_sizes, dim=-1)
-        out_coords, out_class = self.decoder(
+        dec_out = self.decoder(
                 tgt=tgt, 
                 memory=value, #memory.transpose(0, 1), 
                 pos=None,
                 refpoints_unsigmoid=refpoint_embed.transpose(0, 1), 
                 spatial_shapes=spatial_shapes,
                 tgt_mask=dn_attn_mask)
+        
+        if self.pred_3d:
+            out_coords, out_class, out_lines3d = dec_out
+        else:
+            out_coords, out_class = dec_out
 
         # output
         if self.training:
             if dn_meta is not None:
                 dn_out_coords, out_coords = torch.split(out_coords, [dn_meta['pad_size'], self.num_queries], dim=2)
                 dn_out_class, out_class = torch.split(out_class, [dn_meta['pad_size'], self.num_queries], dim=2)
+                if self.pred_3d:
+                    dn_out_lines3d, out_lines3d = torch.split(out_lines3d, [dn_meta['pad_size'], self.num_queries], dim=2)
 
             out = {'pred_logits': out_class[-1], 'pred_lines': out_coords[-1]}
+            if self.pred_3d:
+                out['pred_lines3d'] = out_lines3d[-1]
 
             if self.decoder.aux_loss:
-                out['aux_outputs'] = self._set_aux_loss(out_class[:-1], out_coords[:-1])
+                out['aux_outputs'] = self._set_aux_loss(
+                    out_class[:-1], 
+                    out_coords[:-1],
+                    out_lines3d[:-1] if self.pred_3d else None
+                )
 
             # for encoder output
             out_coords_enc = refpoint_embed_undetach.sigmoid()
             out_class_enc = self.enc_out_class_embed(tgt_undetach)
-            out['aux_interm_outputs'] = {'pred_logits': out_class_enc, 'pred_lines': out_coords_enc}
+            out['aux_interm_outputs'] = {
+                'pred_logits': out_class_enc,
+                'pred_lines': out_coords_enc
+            }
+            if self.pred_3d:
+                out['aux_interm_outputs']['pred_lines3d'] = out_lines3d_enc
 
             if dn_meta is not None:
                 dn_out = {}
-                dn_out['aux_outputs'] = self._set_aux_loss(dn_out_class, dn_out_coords)
+                dn_out['aux_outputs'] = self._set_aux_loss(
+                    dn_out_class, 
+                    dn_out_coords, 
+                    dn_out_lines3d if self.pred_3d else None
+                )
                 out['aux_denoise'] = dn_out
         else:
             out = {'pred_logits': out_class[0], 'pred_lines': out_coords[0]}
+            if self.pred_3d:
+                out['pred_lines3d'] = out_lines3d[0]
 
         out['dn_meta'] = dn_meta
 
         return out
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord):
+    def _set_aux_loss(self, outputs_class, outputs_coord, outputs_line3d=None):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
-        return [{'pred_logits': a, 'pred_lines': b}
-                for a, b in zip(outputs_class, outputs_coord)]
+
+        if outputs_line3d is None:
+            return [{'pred_logits': a, 'pred_lines': b}
+                    for a, b in zip(outputs_class, outputs_coord)]
+        else:
+            return [{'pred_logits': a, 'pred_lines': b, 'pred_lines3d': c}
+                    for a, b, c in zip(outputs_class, outputs_coord, outputs_line3d)]
 
     @torch.jit.unused
     def _set_aux_loss2(self, outputs_class, outputs_coord, outputs_corners, outputs_ref,
@@ -570,5 +628,5 @@ def build_decoder(args):
             dn_number=args.dn_number,
             dn_label_noise_ratio=args.dn_label_noise_ratio,
             dn_line_noise_scale=args.dn_line_noise_scale,
+            pred_3d = args.linea3d,
             )
-

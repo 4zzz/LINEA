@@ -4,8 +4,9 @@ from pathlib import Path
 import warnings
 import json
 import zipfile
-
+from typing import Tuple
 import numpy as np
+import numpy.typing as npt
 import torch
 from torch.utils.data import DataLoader, Dataset
 from PIL import Image
@@ -213,7 +214,7 @@ class Monolines3D(torch.utils.data.Dataset):
                 loadable_image_path = image_path.resolve()
 
                 try:
-                     line_target = self.resolve_target_lines(annotation)
+                     lines2d, lines3d = self.resolve_target_lines(annotation)
                 except Exception as e:
                     msg = f"Could not resolve line targets for {image_path} ({e})"
                     scene_info["bad_annotations"].append(str(rel_annotation_path))
@@ -223,8 +224,8 @@ class Monolines3D(torch.utils.data.Dataset):
                 entry = {
                     "sample_id": sample_id_counter,
                     "image_path": str(loadable_image_path),
-                    #"annotation": annotation,
-                    "target_lines": line_target,
+                    "target_lines2d": lines2d,
+                    "target_lines3d": lines3d,
                 }
 
                 if self.preload:
@@ -258,7 +259,7 @@ class Monolines3D(torch.utils.data.Dataset):
 
         if experiment_dir is not None and os.path.isdir(experiment_dir):
             path = os.path.join(experiment_dir, f'scene_info_{split}.json')
-            save_json(path, scene_info)
+            save_json(path, self.used_data)
 
 
         print('Split:', split)
@@ -303,26 +304,23 @@ class Monolines3D(torch.utils.data.Dataset):
     def load_image(self, image_path):
         return Image.open(str(image_path)).convert("RGB")
 
-    def resolve_target_lines(self, annotation) -> torch.Tensor | None:
+    def resolve_target_lines(self, annotation) -> Tuple[npt.NDArray[any], npt.NDArray[any]] | None:
         img_size = np.array([annotation['img_file_width'], annotation['img_file_height']])
 
         if 'from_limap_tracks' in annotation['lines']:
             lines = annotation['lines']['from_limap_tracks']
-            target = []
+            lines2d = []
+            lines3d = []
             for line in lines:
-                if self.train2d:
-                    line2d = np.array(line['line2d'])
-
-                    if self.use_image_normalized_target_line_coords:
-                        img_size = np.array([annotation['img_file_width'], annotation['img_file_height']])
-                        l = np.concatenate([line2d[0]/img_size, line2d[1]/img_size])
-                    else:
-                        l = np.concatenate([line2d[0], line2d[1]])
-                    target.append(l)
+                line2d = np.array(line['line2d'])
+                if self.use_image_normalized_target_line_coords:
+                    l = np.concatenate([line2d[0]/img_size, line2d[1]/img_size])
                 else:
-                    line3d = np.array(line['camera']['track3d_trimmed'])
-                    target.append(np.concatenate([line3d[0], line3d[1]]))
-            return np.array(target)
+                    l = np.concatenate([line2d[0], line2d[1]])
+                lines2d.append(l)
+                line3d = np.array(line['camera']['track3d_trimmed'])
+                lines3d.append(np.concatenate([line3d[0], line3d[1]]))
+            return np.array(lines2d), np.array(lines3d)
         raise Exception('Didnt find usable lines type')
 
     def __len__(self):
@@ -338,13 +336,14 @@ class Monolines3D(torch.utils.data.Dataset):
 
         w, h = img.size
         target = {}
-        line_dim = 4 if self.train2d else 6
-        lines = entry['target_lines'].reshape(-1, line_dim)#[[0, 2]]
+        lines2d = entry['target_lines2d'].reshape(-1, 4)
+        lines3d = entry['target_lines3d'].reshape(-1, 6)
         target['image_id'] = np.array([entry['sample_id']])
-        target['labels'] = np.array([0 for _ in lines], dtype=np.int64)
-        target['area'] = np.array([1 for _ in lines])
-        target['iscrowd'] = np.array([0 for _ in lines])
-        target['lines'] = lines.astype(np.float32)
+        target['labels'] = np.array([0 for _ in lines2d], dtype=np.int64)
+        target['area'] = np.array([1 for _ in lines2d])
+        target['iscrowd'] = np.array([0 for _ in lines2d])
+        target['lines'] = lines2d.astype(np.float32)
+        target['lines3d'] = lines3d.astype(np.float32)
         target['orig_size'] = np.array([h, w])
         target['size'] = np.array([h, w])
 
