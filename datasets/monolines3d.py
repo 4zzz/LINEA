@@ -402,7 +402,6 @@ def make_coco_transforms(image_set, args=None):
     if args.mono3d_do_not_normalize_images is False:
         ts.append(T.Normalize([0.538, 0.494, 0.453], [0.257, 0.263, 0.273], normalize_lines=normalize_lines))
     else:
-
         ts.append(T.Normalize([0.0, 0.0, 0.0], [1.0, 1.0, 1.0], normalize_lines=normalize_lines))
     normalize = T.Compose(ts)
 
@@ -445,6 +444,7 @@ def make_coco_transforms(image_set, args=None):
         if test_size is None:
             return normalize
         else:
+            max_size = args.data_aug_max_size
             return T.Compose([
                 T.RandomResize([test_size], max_size=max_size),
                 normalize,
