@@ -128,11 +128,11 @@ def build_args(parser, required=None):
     parser.add_argument('--mono3d_strict', action='store_true', default=False)
 
 class Monolines3D(torch.utils.data.Dataset):
-    def __init__(self, root_dir, split, train2d, use_image_normalized_target_line_coords, normalize_line_space, do_not_normalize_images, preload, strict, transforms=None, experiment_dir=None):
+    def __init__(self, root_dir, split, train2d, use_image_normalized_target_line_coords, normalize_3d_line_space, do_not_normalize_images, preload, strict, transforms=None, experiment_dir=None):
         self.split = split
         self.train2d = train2d
         self.use_image_normalized_target_line_coords = use_image_normalized_target_line_coords
-        self.normalize_line_space = normalize_line_space
+        self.normalize_3d_line_space = normalize_3d_line_space
         self.do_not_normalize_images = do_not_normalize_images
         self.preload = preload
         self.transforms = transforms
@@ -246,7 +246,7 @@ class Monolines3D(torch.utils.data.Dataset):
 
             self.used_data.append(scene_info)
 
-        if self.normalize_line_space:
+        if self.normalize_3d_line_space:
             print('Computing normalization constants...')
             mean, std = self.line_space_normalization_constants()
             scene_info['line_space_normalization'] = {
@@ -255,7 +255,7 @@ class Monolines3D(torch.utils.data.Dataset):
             }
             print('Normalizing lines...')
             for i in range(len(self.entries)):
-                self.entries[i]['target_lines'] = self.normalize_lines(self.entries[i]['target_lines'], std, mean).numpy()
+                self.entries[i]['target_lines3d'] = self.normalize_lines(self.entries[i]['target_lines3d'], std, mean).numpy()
 
         if experiment_dir is not None and os.path.isdir(experiment_dir):
             path = os.path.join(experiment_dir, f'scene_info_{split}.json')
@@ -276,7 +276,7 @@ class Monolines3D(torch.utils.data.Dataset):
     def line_space_normalization_constants(self):
         endpoints = []
         for entry in self.entries:
-            lines = entry['target_lines']
+            lines = entry['target_lines3d']
             for line in lines:
                 #print(line.shape)
                 dim = line.shape[0] // 2
@@ -467,7 +467,7 @@ def build_mono3d_from_args(image_set, args):
         "split": image_set,
         "train2d": args.mono3d_train2d,
         "use_image_normalized_target_line_coords": args.mono3d_use_image_normalized_target_line_coords,
-        "normalize_line_space": args.mono3d_normalize_line_space,
+        "normalize_3d_line_space": args.mono3d_normalize_3d_line_space,
         "preload": args.mono3d_preload_images,
         "strict": args.mono3d_strict,
         "do_not_normalize_images": args.mono3d_do_not_normalize_images,
