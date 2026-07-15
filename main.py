@@ -109,7 +109,20 @@ def _git_metadata():
         untracked_files = [line for line in untracked_output.splitlines() if line]
         metadata['untracked_files'] = untracked_files
         patches = []
+        skip_prefixes = ('output/', 'logs/')
+        max_untracked_diff_bytes = 1_000_000
         for path in untracked_files:
+            normalized_path = path.replace(os.sep, '/')
+            if normalized_path.startswith(skip_prefixes):
+                patches.append(f'# Skipped generated untracked file: {path}\n')
+                continue
+            try:
+                if os.path.getsize(path) > max_untracked_diff_bytes:
+                    patches.append(f'# Skipped large untracked file: {path}\n')
+                    continue
+            except OSError:
+                patches.append(f'# Could not stat untracked file: {path}\n')
+                continue
             try:
                 patch = subprocess.run(
                     ['git', 'diff', '--no-index', '--binary', '/dev/null', path],
