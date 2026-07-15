@@ -22,7 +22,17 @@ class LINEACriterion(nn.Module):
         1) we compute hungarian assignment between ground truth boxes and the outputs of the model
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
-    def __init__(self, num_classes, matcher, weight_dict, focal_alpha, losses, line3d_alignment='xyz_shift'):
+    def __init__(
+        self,
+        num_classes,
+        matcher,
+        weight_dict,
+        focal_alpha,
+        losses,
+        line3d_alignment='xyz_shift',
+        line3d_loss_type='l1',
+        line3d_smooth_l1_beta=1.0,
+    ):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -38,6 +48,8 @@ class LINEACriterion(nn.Module):
         self.losses = losses
         self.focal_alpha = focal_alpha
         self.line3d_alignment = line3d_alignment
+        self.line3d_loss_type = line3d_loss_type
+        self.line3d_smooth_l1_beta = line3d_smooth_l1_beta
 
     def loss_labels(self, outputs, targets, indices, num_boxes):
         """Classification loss (Binary focal loss)
@@ -132,9 +144,21 @@ class LINEACriterion(nn.Module):
             raise ValueError(f"Unknown line3d_alignment value '{self.line3d_alignment}'.")
 
         src_aligned = scale[:, None, None] * src_pts_flat + shift[:, None, :]
-        loss = F.l1_loss(src_aligned, tgt_pts_flat, reduction='none')
+        loss = self._line3d_regression_loss(src_aligned, tgt_pts_flat)
 
         return loss.sum()
+
+    def _line3d_regression_loss(self, src_aligned, tgt_pts_flat):
+        if self.line3d_loss_type == 'l1':
+            return F.l1_loss(src_aligned, tgt_pts_flat, reduction='none')
+        if self.line3d_loss_type == 'smooth_l1':
+            return F.smooth_l1_loss(
+                src_aligned,
+                tgt_pts_flat,
+                reduction='none',
+                beta=self.line3d_smooth_l1_beta,
+            )
+        raise ValueError(f"Unknown line3d_loss_type '{self.line3d_loss_type}'.")
 
     def loss_lmap(self, outputs, targets, indices, num_boxes):
         losses = {}
@@ -571,7 +595,9 @@ def build_criterion(args):
             weight_dict=args.weight_dict,
             focal_alpha=args.focal_alpha, 
             losses=args.losses, 
-            line3d_alignment=getattr(args, 'line3d_alignment', 'xyz_shift')
+            line3d_alignment=getattr(args, 'line3d_alignment', 'xyz_shift'),
+            line3d_loss_type=getattr(args, 'line3d_loss_type', 'l1'),
+            line3d_smooth_l1_beta=getattr(args, 'line3d_smooth_l1_beta', 1.0),
         )
     elif args.criterion_type == 'dfine':
         criterion = DFINESetCriterion(num_classes, matcher=matcher, weight_dict=args.weight_dict,
