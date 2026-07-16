@@ -252,15 +252,13 @@ def save_on_master(*args, **kwargs):
 def init_distributed_mode(args):
     try:
         # https://pytorch.org/docs/stable/elastic/run.html
-        RANK = int(os.getenv('RANK', -1))
-        args.gpu = LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))
-        WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
+        args.rank = int(os.getenv('RANK', -1))
+        args.gpu = args.local_rank = int(os.getenv('LOCAL_RANK', -1))
+        args.world_size = int(os.getenv('WORLD_SIZE', 1))
 
-        torch.distributed.init_process_group(init_method='env://')
+        torch.cuda.set_device(args.gpu)
+        torch.distributed.init_process_group(init_method='env://', device_id=args.gpu)
         torch.distributed.barrier()
-
-        rank = torch.distributed.get_rank()
-        torch.cuda.set_device(rank)
         torch.cuda.empty_cache()
         args.distributed = True
         setup_for_distributed(get_rank() == 0)

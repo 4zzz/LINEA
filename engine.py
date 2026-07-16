@@ -15,6 +15,41 @@ def _move_targets_to_device(targets, device):
     return [{k: v.to(device) for k, v in t.items() if torch.is_tensor(v)} for t in targets]
 
 
+def _get_line3d_loss_weight(args, criterion, global_step):
+    schedule = getattr(args, 'line3d_loss_weight_schedule', None)
+    if schedule is None:
+        return None
+
+    if 'loss_line3d' not in criterion.weight_dict:
+        return None
+
+    base_weight = getattr(criterion, '_base_line3d_loss_weight', None)
+    if base_weight is None:
+        base_weight = criterion.weight_dict['loss_line3d']
+        criterion._base_line3d_loss_weight = base_weight
+
+    start = getattr(args, 'line3d_loss_weight_start', 0.0)
+    end = getattr(args, 'line3d_loss_weight_end', base_weight)
+
+    if schedule == 'constant':
+        return end
+
+    if schedule == 'linear_warmup':
+        warmup_steps = max(1, int(getattr(args, 'line3d_loss_weight_warmup_steps', 1)))
+        alpha = min(max(global_step / warmup_steps, 0.0), 1.0)
+        return start + alpha * (end - start)
+
+    raise ValueError(f"Unknown line3d_loss_weight_schedule '{schedule}'.")
+
+
+def _update_loss_weight_meters(metric_logger, criterion):
+    for name, value in criterion.weight_dict.items():
+        meter_name = f'{name}_w'
+        if meter_name not in metric_logger.meters:
+            metric_logger.add_meter(meter_name, utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+        metric_logger.update(**{meter_name: value})
+
+
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0, writer=None,
@@ -33,6 +68,10 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         targets = _move_targets_to_device(targets, device)
 
         global_step = epoch * len(data_loader) + i
+        line3d_loss_weight = _get_line3d_loss_weight(args, criterion, global_step)
+        if line3d_loss_weight is not None:
+            criterion.weight_dict['loss_line3d'] = line3d_loss_weight
+        _update_loss_weight_meters(metric_logger, criterion)
 
 
         with torch.amp.autocast(str(device), enabled=args.amp):
@@ -77,7 +116,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 ema_m.update(model)
 
         metric_logger.update(loss=loss_value, **loss_dict_reduced)
-        metric_logger.update(lr=optimizer.param_groups[0]["lr"])     
+        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
         if writer and utils.is_main_process() and global_step % 10 == 0:
             writer.add_scalar('Loss/total', loss_value, global_step)
@@ -85,6 +124,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 writer.add_scalar(f'Lr/pg_{j}', pg['lr'], global_step)
             for k, v in loss_dict_reduced.items():
                 writer.add_scalar(f'Loss/{k}', v.item(), global_step)
+            for name, value in criterion.weight_dict.items():
+                writer.add_scalar(f'LossWeight/{name}', value, global_step)
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
