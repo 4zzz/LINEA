@@ -56,6 +56,8 @@ checkpoint = torch.load(args.model, map_location="cpu", weights_only=False)
 model_args = checkpoint['args']
 if not hasattr(model_args, 'linea3d'):
     model_args.linea3d = False
+if not hasattr(model_args, 'line3d_pred_strategy'):
+    model_args.line3d_pred_strategy = 'direct'
 
 #for name, value in vars(args).items():
 #    if name in model_args:
@@ -90,8 +92,8 @@ class Model(nn.Module):
         self.model = model.deploy()
         self.postprocessor = postprocessor.deploy()
 
-    def forward(self, images, orig_target_sizes):
-        raw_outputs = self.model(images)
+    def forward(self, images, orig_target_sizes, targets=None):
+        raw_outputs = self.model(images, targets)
         lines, scores = self.postprocessor(raw_outputs, orig_target_sizes)
         return raw_outputs, lines, scores
 
@@ -262,7 +264,11 @@ with torch.no_grad():
         orig_target_sizes = np.array([[tgt['orig_size'][1].item(), tgt['orig_size'][0].item()] for tgt in targets])
 
         targets_device = _move_targets_to_device(targets, device)
-        raw_outputs, lines, scores = model(samples.to(device), torch.tensor(orig_target_sizes).to(device))
+        raw_outputs, lines, scores = model(
+            samples.to(device),
+            torch.tensor(orig_target_sizes).to(device),
+            targets_device,
+        )
         if args.fit_affine:
             indices = matcher(raw_outputs, targets_device)
             fitted_lines3d = _fit_affine_lines3d(

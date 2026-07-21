@@ -20,6 +20,11 @@ from .dn_components import prepare_for_cdn
 from .attention_mechanism import MSDeformAttn, MSDeformLineAttn
 from .linea_utils import weighting_function, distance2bbox, inverse_sigmoid, get_activation
 
+
+def _inverse_softplus(x: float) -> float:
+    x_tensor = torch.tensor(float(x), dtype=torch.float32)
+    return torch.log(torch.expm1(x_tensor)).item()
+
 class MLP(nn.Module):
     """ Very simple multi-layer perceptron (also called FFN)"""
 
@@ -171,6 +176,8 @@ class TransformerDecoder(nn.Module):
         reg_max=32,
         reg_scale=4,
         pred_3d=False,
+        line3d_pred_strategy='direct',
+        line3d_uv_depth_init_depth=7.0,
         ):
         super().__init__()
         if num_layers > 0:
@@ -207,10 +214,17 @@ class TransformerDecoder(nn.Module):
         self.integral = Integral(self.reg_max)
 
         self.pred_3d = pred_3d
+        self.line3d_pred_strategy = line3d_pred_strategy
         if self.pred_3d:
-            _line3d_embed = MLP(d_model, d_model, 6, 3)
+            line3d_output_dim = 6 if self.line3d_pred_strategy == 'direct' else 2
+            _line3d_embed = MLP(d_model, d_model, line3d_output_dim, 3)
             nn.init.constant_(_line3d_embed.layers[-1].weight.data, 0)
             nn.init.constant_(_line3d_embed.layers[-1].bias.data, 0)
+            if self.line3d_pred_strategy == 'uv_depth':
+                nn.init.constant_(
+                    _line3d_embed.layers[-1].bias.data,
+                    _inverse_softplus(max(line3d_uv_depth_init_depth - 1e-3, 1e-6)),
+                )
             self.line3d_embed = nn.ModuleList([copy.deepcopy(_line3d_embed) for _ in range(num_layers)])
 
         self.aux_loss = aux_loss
@@ -359,6 +373,8 @@ class LINEATransformer(nn.Module):
         eval_spatial_size=None,
         eval_idx=5,
         pred_3d = False,
+        line3d_pred_strategy='direct',
+        line3d_uv_depth_init_depth=7.0,
         ):
         super().__init__()
 
@@ -400,13 +416,22 @@ class LINEATransformer(nn.Module):
                                         num_feature_levels=num_feature_levels, 
                                         eval_idx=eval_idx, aux_loss=aux_loss,
                                         reg_max=reg_max, reg_scale=reg_scale,
-                                        pred_3d=pred_3d)
+                                        pred_3d=pred_3d,
+                                        line3d_pred_strategy=line3d_pred_strategy,
+                                        line3d_uv_depth_init_depth=line3d_uv_depth_init_depth)
 
         self.pred_3d = pred_3d
+        self.line3d_pred_strategy = line3d_pred_strategy
         if self.pred_3d:
-            _line3d_embed = MLP(d_model, d_model, 6, 3)
+            line3d_output_dim = 6 if self.line3d_pred_strategy == 'direct' else 2
+            _line3d_embed = MLP(d_model, d_model, line3d_output_dim, 3)
             nn.init.constant_(_line3d_embed.layers[-1].weight.data, 0)
             nn.init.constant_(_line3d_embed.layers[-1].bias.data, 0)
+            if self.line3d_pred_strategy == 'uv_depth':
+                nn.init.constant_(
+                    _line3d_embed.layers[-1].bias.data,
+                    _inverse_softplus(max(line3d_uv_depth_init_depth - 1e-3, 1e-6)),
+                )
             self.enc_out_line3d_embed = copy.deepcopy(_line3d_embed)
 
         # for inference mode
@@ -433,6 +458,39 @@ class LINEATransformer(nn.Module):
         for m in self.modules():
             if isinstance(m, MSDeformAttn): # or isinstance(m, MSDeformLineAttn):
                 m._reset_parameters()
+
+    def _decode_uv_depth_lines3d(self, lines2d, depth_params, targets):
+        if targets is None:
+            raise ValueError("line3d_pred_strategy='uv_depth' requires targets with camera_K and size.")
+
+        camera_k = torch.stack([t['camera_K'] for t in targets], dim=0).to(device=lines2d.device, dtype=lines2d.dtype)
+        image_sizes = torch.stack([t['size'] for t in targets], dim=0).to(device=lines2d.device, dtype=lines2d.dtype)
+
+        prefix_shape = lines2d.shape[:-3]
+        batch_size = lines2d.shape[-3]
+
+        scale = torch.stack(
+            [image_sizes[:, 1], image_sizes[:, 0], image_sizes[:, 1], image_sizes[:, 0]],
+            dim=-1,
+        )
+        scale = scale.view(*([1] * len(prefix_shape)), batch_size, 1, 4)
+        lines2d_pixels = lines2d * scale
+
+        uv = lines2d_pixels.view(*lines2d.shape[:-1], 2, 2)
+        uv_h = torch.cat([uv, torch.ones_like(uv[..., :1])], dim=-1).unsqueeze(-1)
+
+        camera_k_inv = torch.linalg.inv(camera_k).view(
+            *([1] * len(prefix_shape)), batch_size, 1, 1, 3, 3
+        )
+        rays = torch.matmul(camera_k_inv, uv_h).squeeze(-1)
+
+        depth = self._decode_line_depths(depth_params)
+        points = rays * depth.unsqueeze(-1)
+        return points.flatten(-2, -1)
+
+    @staticmethod
+    def _decode_line_depths(depth_params):
+        return F.softplus(depth_params) + 1e-3
 
     def generate_anchors(self, spatial_shapes):
         proposals = []
@@ -497,7 +555,7 @@ class LINEATransformer(nn.Module):
         refpoint_embed = refpoint_embed_undetach.detach()
 
         if self.pred_3d is True and self.training is True:
-            out_lines3d_enc = self.enc_out_line3d_embed(selected_output_memory)
+            out_lines3d_enc_params = self.enc_out_line3d_embed(selected_output_memory)
 
         # gather tgt
         tgt_undetach = torch.gather(output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, self.d_model)) if self.training else None
@@ -526,9 +584,25 @@ class LINEATransformer(nn.Module):
                 tgt_mask=dn_attn_mask)
         
         if self.pred_3d:
-            out_coords, out_class, out_lines3d = dec_out
+            out_coords, out_class, out_lines3d_params = dec_out
         else:
             out_coords, out_class = dec_out
+
+        if self.pred_3d:
+            if self.line3d_pred_strategy == 'direct':
+                out_lines3d = out_lines3d_params
+                if self.training:
+                    out_lines3d_enc = out_lines3d_enc_params
+            elif self.line3d_pred_strategy == 'uv_depth':
+                out_lines3d = self._decode_uv_depth_lines3d(out_coords, out_lines3d_params, targets)
+                if self.training:
+                    out_lines3d_enc = self._decode_uv_depth_lines3d(
+                        out_coords_enc := refpoint_embed_undetach.sigmoid(),
+                        out_lines3d_enc_params,
+                        targets,
+                    )
+            else:
+                raise ValueError(f"Unknown line3d_pred_strategy '{self.line3d_pred_strategy}'.")
 
         # output
         if self.training:
@@ -537,16 +611,23 @@ class LINEATransformer(nn.Module):
                 dn_out_class, out_class = torch.split(out_class, [dn_meta['pad_size'], self.num_queries], dim=2)
                 if self.pred_3d:
                     dn_out_lines3d, out_lines3d = torch.split(out_lines3d, [dn_meta['pad_size'], self.num_queries], dim=2)
+                    dn_out_lines3d_params, out_lines3d_params = torch.split(
+                        out_lines3d_params, [dn_meta['pad_size'], self.num_queries], dim=2
+                    )
 
             out = {'pred_logits': out_class[-1], 'pred_lines': out_coords[-1]}
             if self.pred_3d:
                 out['pred_lines3d'] = out_lines3d[-1]
+                if self.line3d_pred_strategy == 'uv_depth':
+                    out['pred_line_depths'] = self._decode_line_depths(out_lines3d_params[-1])
 
             if self.decoder.aux_loss:
                 out['aux_outputs'] = self._set_aux_loss(
                     out_class[:-1], 
                     out_coords[:-1],
-                    out_lines3d[:-1] if self.pred_3d else None
+                    out_lines3d[:-1] if self.pred_3d else None,
+                    self._decode_line_depths(out_lines3d_params[:-1])
+                    if (self.pred_3d and self.line3d_pred_strategy == 'uv_depth') else None
                 )
 
             # for encoder output
@@ -558,26 +639,32 @@ class LINEATransformer(nn.Module):
             }
             if self.pred_3d:
                 out['aux_interm_outputs']['pred_lines3d'] = out_lines3d_enc
+                if self.line3d_pred_strategy == 'uv_depth':
+                    out['aux_interm_outputs']['pred_line_depths'] = self._decode_line_depths(out_lines3d_enc_params)
 
             if dn_meta is not None:
                 dn_out = {}
                 dn_out['aux_outputs'] = self._set_aux_loss(
                     dn_out_class, 
                     dn_out_coords, 
-                    dn_out_lines3d if self.pred_3d else None
+                    dn_out_lines3d if self.pred_3d else None,
+                    self._decode_line_depths(dn_out_lines3d_params)
+                    if (self.pred_3d and self.line3d_pred_strategy == 'uv_depth') else None
                 )
                 out['aux_denoise'] = dn_out
         else:
             out = {'pred_logits': out_class[0], 'pred_lines': out_coords[0]}
             if self.pred_3d:
                 out['pred_lines3d'] = out_lines3d[0]
+                if self.line3d_pred_strategy == 'uv_depth':
+                    out['pred_line_depths'] = self._decode_line_depths(out_lines3d_params[0])
 
         out['dn_meta'] = dn_meta
 
         return out
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord, outputs_line3d=None):
+    def _set_aux_loss(self, outputs_class, outputs_coord, outputs_line3d=None, outputs_line_depths=None):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
@@ -585,9 +672,13 @@ class LINEATransformer(nn.Module):
         if outputs_line3d is None:
             return [{'pred_logits': a, 'pred_lines': b}
                     for a, b in zip(outputs_class, outputs_coord)]
-        else:
+        if outputs_line_depths is None:
             return [{'pred_logits': a, 'pred_lines': b, 'pred_lines3d': c}
                     for a, b, c in zip(outputs_class, outputs_coord, outputs_line3d)]
+        return [
+            {'pred_logits': a, 'pred_lines': b, 'pred_lines3d': c, 'pred_line_depths': d}
+            for a, b, c, d in zip(outputs_class, outputs_coord, outputs_line3d, outputs_line_depths)
+        ]
 
     @torch.jit.unused
     def _set_aux_loss2(self, outputs_class, outputs_coord, outputs_corners, outputs_ref,
@@ -629,4 +720,6 @@ def build_decoder(args):
             dn_label_noise_ratio=args.dn_label_noise_ratio,
             dn_line_noise_scale=args.dn_line_noise_scale,
             pred_3d = args.linea3d,
+            line3d_pred_strategy=getattr(args, 'line3d_pred_strategy', 'direct'),
+            line3d_uv_depth_init_depth=getattr(args, 'line3d_uv_depth_init_depth', 7.0),
             )
