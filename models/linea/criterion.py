@@ -32,6 +32,7 @@ class LINEACriterion(nn.Module):
         line3d_alignment='xyz_shift',
         line3d_loss_type='l1',
         line3d_smooth_l1_beta=1.0,
+        line3d_z_loss_type='l1',
     ):
         """ Create the criterion.
         Parameters:
@@ -50,6 +51,7 @@ class LINEACriterion(nn.Module):
         self.line3d_alignment = line3d_alignment
         self.line3d_loss_type = line3d_loss_type
         self.line3d_smooth_l1_beta = line3d_smooth_l1_beta
+        self.line3d_z_loss_type = line3d_z_loss_type
 
     def loss_labels(self, outputs, targets, indices, num_boxes):
         """Classification loss (Binary focal loss)
@@ -116,13 +118,39 @@ class LINEACriterion(nn.Module):
             loss_direct = self._aligned_lines3d_loss(src_pts, tgt_pts)
             loss_swapped = self._aligned_lines3d_loss(src_pts, tgt_pts_swapped)
 
-            losses_per_image.append(torch.minimum(loss_direct, loss_swapped))
+            losses_per_image.append(torch.minimum(loss_direct, loss_swapped).sum())
 
         if len(losses_per_image) == 0:
             return {'loss_line3d': outputs['pred_lines3d'].sum() * 0.0}
 
         loss_line3d = torch.stack(losses_per_image).sum() / num_boxes
         return {'loss_line3d': loss_line3d}
+
+    def loss_lines3d_z(self, outputs, targets, indices, num_boxes):
+        assert 'pred_lines3d' in outputs
+
+        losses_per_image = []
+
+        for batch_i, ((src_idx, tgt_idx), target) in enumerate(zip(indices, targets)):
+            if len(src_idx) == 0:
+                continue
+
+            src_lines3d = outputs['pred_lines3d'][batch_i, src_idx].view(-1, 2, 3)
+            tgt_lines3d = target['lines3d'][tgt_idx].view(-1, 2, 3)
+
+            src_z = src_lines3d[..., 2]
+            tgt_z = tgt_lines3d[..., 2]
+            tgt_z_swapped = tgt_z[:, [1, 0]]
+
+            loss_direct = self._line3d_z_regression_loss(src_z, tgt_z).sum(dim=-1)
+            loss_swapped = self._line3d_z_regression_loss(src_z, tgt_z_swapped).sum(dim=-1)
+            losses_per_image.append(torch.minimum(loss_direct, loss_swapped).sum())
+
+        if len(losses_per_image) == 0:
+            return {'loss_line3d_z': outputs['pred_lines3d'].sum() * 0.0}
+
+        loss_line3d_z = torch.stack(losses_per_image).sum() / num_boxes
+        return {'loss_line3d_z': loss_line3d_z}
 
     def _aligned_lines3d_loss(self, src_pts, tgt_pts):
         # src_pts, tgt_pts: [M, 2, 3]
@@ -146,7 +174,7 @@ class LINEACriterion(nn.Module):
         src_aligned = scale[:, None, None] * src_pts_flat + shift[:, None, :]
         loss = self._line3d_regression_loss(src_aligned, tgt_pts_flat)
 
-        return loss.sum()
+        return loss.reshape(-1, 2, 3).sum(dim=(1, 2))
 
     def _line3d_regression_loss(self, src_aligned, tgt_pts_flat):
         if self.line3d_loss_type == 'l1':
@@ -159,6 +187,18 @@ class LINEACriterion(nn.Module):
                 beta=self.line3d_smooth_l1_beta,
             )
         raise ValueError(f"Unknown line3d_loss_type '{self.line3d_loss_type}'.")
+
+    def _line3d_z_regression_loss(self, src_z, tgt_z):
+        if self.line3d_z_loss_type == 'l1':
+            return F.l1_loss(src_z, tgt_z, reduction='none')
+        if self.line3d_z_loss_type == 'smooth_l1':
+            return F.smooth_l1_loss(
+                src_z,
+                tgt_z,
+                reduction='none',
+                beta=self.line3d_smooth_l1_beta,
+            )
+        raise ValueError(f"Unknown line3d_z_loss_type '{self.line3d_z_loss_type}'.")
 
     def loss_lmap(self, outputs, targets, indices, num_boxes):
         losses = {}
@@ -199,6 +239,7 @@ class LINEACriterion(nn.Module):
             'labels': self.loss_labels,
             'lines': self.loss_lines,
             'lines3d': self.loss_lines3d,
+            'lines3d_z': self.loss_lines3d_z,
             'lmap': self.loss_lmap,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
@@ -598,6 +639,7 @@ def build_criterion(args):
             line3d_alignment=getattr(args, 'line3d_alignment', 'xyz_shift'),
             line3d_loss_type=getattr(args, 'line3d_loss_type', 'l1'),
             line3d_smooth_l1_beta=getattr(args, 'line3d_smooth_l1_beta', 1.0),
+            line3d_z_loss_type=getattr(args, 'line3d_z_loss_type', 'l1'),
         )
     elif args.criterion_type == 'dfine':
         criterion = DFINESetCriterion(num_classes, matcher=matcher, weight_dict=args.weight_dict,
