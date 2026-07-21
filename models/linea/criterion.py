@@ -112,13 +112,7 @@ class LINEACriterion(nn.Module):
             src_pts = src_lines3d.view(-1, 2, 3)
             tgt_pts = tgt_lines3d.view(-1, 2, 3)
 
-            # Endpoint-order invariance
-            tgt_pts_swapped = tgt_pts[:, [1, 0], :]
-
-            loss_direct = self._aligned_lines3d_loss(src_pts, tgt_pts)
-            loss_swapped = self._aligned_lines3d_loss(src_pts, tgt_pts_swapped)
-
-            losses_per_image.append(torch.minimum(loss_direct, loss_swapped).sum())
+            losses_per_image.append(self._aligned_lines3d_loss(src_pts, tgt_pts).sum())
 
         if len(losses_per_image) == 0:
             return {'loss_line3d': outputs['pred_lines3d'].sum() * 0.0}
@@ -155,8 +149,28 @@ class LINEACriterion(nn.Module):
     def _aligned_lines3d_loss(self, src_pts, tgt_pts):
         # src_pts, tgt_pts: [M, 2, 3]
 
+        # Line centers are invariant to endpoint ordering. Use them for an
+        # initial alignment, resolve each line's orientation, then refit using
+        # all endpoints for the final loss.
+        src_centers = src_pts.mean(dim=1).unsqueeze(0)
+        tgt_centers = tgt_pts.mean(dim=1).unsqueeze(0)
+        center_weight = torch.ones(
+            src_centers.shape[:2],
+            dtype=src_pts.dtype,
+            device=src_pts.device,
+        )
+        scale, shift = self._fit_line3d_alignment(src_centers, tgt_centers, center_weight)
+        src_initial = scale[:, None, None] * src_pts.unsqueeze(0) + shift[:, None, None, :]
+        src_initial = src_initial.squeeze(0)
+
+        tgt_pts_swapped = tgt_pts[:, [1, 0], :]
+        direct_error = self._line3d_regression_loss(src_initial, tgt_pts).sum(dim=(1, 2))
+        swapped_error = self._line3d_regression_loss(src_initial, tgt_pts_swapped).sum(dim=(1, 2))
+        use_swapped = swapped_error < direct_error
+        tgt_pts_ordered = torch.where(use_swapped[:, None, None], tgt_pts_swapped, tgt_pts)
+
         src_pts_flat = src_pts.reshape(1, -1, 3)   # [1, 2M, 3]
-        tgt_pts_flat = tgt_pts.reshape(1, -1, 3)   # [1, 2M, 3]
+        tgt_pts_flat = tgt_pts_ordered.reshape(1, -1, 3)   # [1, 2M, 3]
 
         weight = torch.ones(
             src_pts_flat.shape[:2],
@@ -164,17 +178,24 @@ class LINEACriterion(nn.Module):
             device=src_pts_flat.device,
         )
 
-        if self.line3d_alignment == 'xyz_shift':
-            scale, shift = align_points_scale_xyz_shift(src_pts_flat, tgt_pts_flat, weight)
-        elif self.line3d_alignment == 'z_shift':
-            scale, shift = align_points_scale_z_shift(src_pts_flat, tgt_pts_flat, weight)
-        else:
-            raise ValueError(f"Unknown line3d_alignment value '{self.line3d_alignment}'.")
+        scale, shift = self._fit_line3d_alignment(src_pts_flat, tgt_pts_flat, weight)
 
         src_aligned = scale[:, None, None] * src_pts_flat + shift[:, None, :]
-        loss = self._line3d_regression_loss(src_aligned, tgt_pts_flat)
+        src_aligned = src_aligned.reshape(-1, 2, 3)
+        loss_direct = self._line3d_regression_loss(src_aligned, tgt_pts)
+        loss_swapped = self._line3d_regression_loss(src_aligned, tgt_pts_swapped)
 
-        return loss.reshape(-1, 2, 3).sum(dim=(1, 2))
+        return torch.minimum(
+            loss_direct.sum(dim=(1, 2)),
+            loss_swapped.sum(dim=(1, 2)),
+        )
+
+    def _fit_line3d_alignment(self, src_pts, tgt_pts, weight):
+        if self.line3d_alignment == 'xyz_shift':
+            return align_points_scale_xyz_shift(src_pts, tgt_pts, weight)
+        if self.line3d_alignment == 'z_shift':
+            return align_points_scale_z_shift(src_pts, tgt_pts, weight)
+        raise ValueError(f"Unknown line3d_alignment value '{self.line3d_alignment}'.")
 
     def _line3d_regression_loss(self, src_aligned, tgt_pts_flat):
         if self.line3d_loss_type == 'l1':
