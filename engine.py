@@ -50,6 +50,28 @@ def _update_loss_weight_meters(metric_logger, criterion):
         metric_logger.update(**{meter_name: value})
 
 
+def _collect_line3d_depth_stats(outputs, targets):
+    if 'pred_line_depths' not in outputs:
+        return {}
+
+    pred_depths = outputs['pred_line_depths']
+    stats = {
+        'pred_depth_mean': pred_depths.mean(),
+        'pred_depth_min': pred_depths.min(),
+        'pred_depth_max': pred_depths.max(),
+    }
+
+    if targets and all('lines3d' in t for t in targets):
+        tgt_z = torch.cat([t['lines3d'].view(-1, 2, 3)[..., 2].reshape(-1) for t in targets], dim=0)
+        stats.update({
+            'tgt_depth_mean': tgt_z.mean(),
+            'tgt_depth_min': tgt_z.min(),
+            'tgt_depth_max': tgt_z.max(),
+        })
+
+    return stats
+
+
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0, writer=None,
@@ -82,6 +104,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
         # reduce losses over all GPUs for logging purposes
         loss_dict_reduced = utils.reduce_dict(loss_dict)
+        depth_stats = _collect_line3d_depth_stats(outputs, targets)
+        depth_stats_reduced = utils.reduce_dict(depth_stats) if depth_stats else {}
         losses_reduced_scaled = sum(loss_dict_reduced.values())
 
         loss_value = losses_reduced_scaled.item()
@@ -116,6 +140,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 ema_m.update(model)
 
         metric_logger.update(loss=loss_value, **loss_dict_reduced)
+        if depth_stats_reduced:
+            metric_logger.update(**{k: v.item() for k, v in depth_stats_reduced.items()})
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
         if writer and utils.is_main_process() and global_step % 10 == 0:
@@ -124,6 +150,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 writer.add_scalar(f'Lr/pg_{j}', pg['lr'], global_step)
             for k, v in loss_dict_reduced.items():
                 writer.add_scalar(f'Loss/{k}', v.item(), global_step)
+            for k, v in depth_stats_reduced.items():
+                writer.add_scalar(f'Depth/{k}', v.item(), global_step)
             for name, value in criterion.weight_dict.items():
                 writer.add_scalar(f'LossWeight/{name}', value, global_step)
 
@@ -155,8 +183,12 @@ def evaluate(model, criterion, postprocessors, data_loader, device, output_dir, 
 
         # reduce losses over all GPUs for logging purposes
         loss_dict_reduced = utils.reduce_dict(loss_dict)
+        depth_stats = _collect_line3d_depth_stats(outputs, targets)
+        depth_stats_reduced = utils.reduce_dict(depth_stats) if depth_stats else {}
         metric_logger.update(loss=sum(loss_dict_reduced.values()),
                              **loss_dict_reduced,)
+        if depth_stats_reduced:
+            metric_logger.update(**{k: v.item() for k, v in depth_stats_reduced.items()})
         
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
