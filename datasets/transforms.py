@@ -21,7 +21,15 @@ def crop(image, target, region):
     # should we do something wrt the original size?
     target["size"] = torch.tensor([h, w])
 
+    if "camera_K" in target:
+        camera_k = target["camera_K"].clone()
+        camera_k[0, 2] -= j
+        camera_k[1, 2] -= i
+        target["camera_K"] = camera_k
+
     fields = ["labels", "area", "iscrowd"]
+    if "lines3d" in target:
+        fields.append("lines3d")
 
     if 'lmap' in target:
         cropped_lmaps = []
@@ -89,8 +97,15 @@ def hflip(image, target):
     target = target.copy()
     if "lines" in target:
         lines = target["lines"]   
-        lines = lines[:, [2, 3, 0, 1]] * torch.as_tensor([-1, 1, -1, 1]) + torch.as_tensor([w, 0, w, 0])
+        lines = lines[:, [2, 3, 0, 1]] * torch.as_tensor([-1, 1, -1, 1]) + torch.as_tensor([w - 1, 0, w - 1, 0])
         target["lines"] = lines
+        if "lines3d" in target:
+            target["lines3d"] = target["lines3d"].view(-1, 2, 3)[:, [1, 0], :].reshape(-1, 6)
+    if "camera_K" in target:
+        camera_k = target["camera_K"].clone()
+        camera_k[0, 0] = -camera_k[0, 0]
+        camera_k[0, 2] = w - 1 - camera_k[0, 2]
+        target["camera_K"] = camera_k
 
     if 'lmap' in target:
         flipped_lmaps = []
@@ -112,10 +127,19 @@ def vflip(image, target):
         lines = target["lines"]
 
         # in dataset, we assume if two points with same x coord, we assume first point is the upper point
-        lines = lines * torch.as_tensor([1, -1, 1, -1]) + torch.as_tensor([0, h, 0, h])
+        lines = lines * torch.as_tensor([1, -1, 1, -1]) + torch.as_tensor([0, h - 1, 0, h - 1])
         vertical_line_idx = (lines[:, 0] == lines[:, 2])
         lines[vertical_line_idx] = torch.index_select(lines[vertical_line_idx], 1, torch.tensor([2,3,0,1]))
         target["lines"] = lines
+        if "lines3d" in target:
+            lines3d = target["lines3d"].view(-1, 2, 3)
+            lines3d[vertical_line_idx] = lines3d[vertical_line_idx][:, [1, 0], :]
+            target["lines3d"] = lines3d.reshape(-1, 6)
+    if "camera_K" in target:
+        camera_k = target["camera_K"].clone()
+        camera_k[1, 1] = -camera_k[1, 1]
+        camera_k[1, 2] = h - 1 - camera_k[1, 2]
+        target["camera_K"] = camera_k
 
     if 'lmap' in target:
         flipped_lmaps = []
@@ -169,6 +193,13 @@ def resize(image, target, size, max_size=None):
         lines = target["lines"]
         scaled_lines = lines * torch.as_tensor([ratio_width, ratio_height, ratio_width, ratio_height])
         target["lines"] = scaled_lines
+    if "camera_K" in target:
+        camera_k = target["camera_K"].clone()
+        camera_k[0, 0] *= ratio_width
+        camera_k[0, 2] *= ratio_width
+        camera_k[1, 1] *= ratio_height
+        camera_k[1, 2] *= ratio_height
+        target["camera_K"] = camera_k
 
     if 'lmap' in target:
         resize_lmaps = []
@@ -411,6 +442,7 @@ class Normalize(object):
     def __init__(self, mean, std, normalize_lines=True):
         self.mean = mean
         self.std = std
+        self.normalize_lines = normalize_lines
 
     def __call__(self, image, target=None):
         image = F.normalize(image, mean=self.mean, std=self.std)
@@ -421,15 +453,20 @@ class Normalize(object):
 
         if "lines" in target:
             lines = target["lines"]
-            lines = lines / torch.tensor([w, h, w, h], dtype=torch.float32)
+            if self.normalize_lines:
+                lines = lines / torch.tensor([w, h, w, h], dtype=torch.float32)
             idx = torch.logical_or(lines[..., 0] > lines[..., 2],
-                torch.logical_or(
-                lines[..., 0] == lines[..., 2],
-                lines[..., 1] < lines[..., 3]
+                torch.logical_and(
+                    lines[..., 0] == lines[..., 2],
+                    lines[..., 1] > lines[..., 3],
                 )
             )
             lines[idx] = lines[idx][:, [2, 3, 0, 1]]
             target["lines"] = lines
+            if "lines3d" in target:
+                lines3d = target["lines3d"].view(-1, 2, 3)
+                lines3d[idx] = lines3d[idx][:, [1, 0], :]
+                target["lines3d"] = lines3d.reshape(-1, 6)
 
         return image, target
 

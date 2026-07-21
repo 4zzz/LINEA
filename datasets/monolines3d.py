@@ -214,7 +214,7 @@ class Monolines3D(torch.utils.data.Dataset):
                 loadable_image_path = image_path.resolve()
 
                 try:
-                     lines2d, lines3d = self.resolve_target_lines(annotation)
+                     lines2d, lines3d, camera_K = self.resolve_target_lines(annotation)
                 except Exception as e:
                     msg = f"Could not resolve line targets for {image_path} ({e})"
                     scene_info["bad_annotations"].append(str(rel_annotation_path))
@@ -226,6 +226,7 @@ class Monolines3D(torch.utils.data.Dataset):
                     "image_path": str(loadable_image_path),
                     "target_lines2d": lines2d,
                     "target_lines3d": lines3d,
+                    "camera_K": camera_K,
                 }
 
                 if self.preload:
@@ -304,23 +305,30 @@ class Monolines3D(torch.utils.data.Dataset):
     def load_image(self, image_path):
         return Image.open(str(image_path)).convert("RGB")
 
-    def resolve_target_lines(self, annotation) -> Tuple[npt.NDArray[any], npt.NDArray[any]] | None:
+    def resolve_target_lines(self, annotation) -> Tuple[npt.NDArray[any], npt.NDArray[any], npt.NDArray[any]] | None:
         img_size = np.array([annotation['img_file_width'], annotation['img_file_height']])
+        camera_K = np.array(annotation['camera']['K'], dtype=np.float32)
 
         if 'from_limap_tracks' in annotation['lines']:
             lines = annotation['lines']['from_limap_tracks']
             lines2d = []
             lines3d = []
             for line in lines:
-                line2d = np.array(line['line2d'])
-                if self.use_image_normalized_target_line_coords:
-                    l = np.concatenate([line2d[0]/img_size, line2d[1]/img_size])
-                else:
-                    l = np.concatenate([line2d[0], line2d[1]])
-                lines2d.append(l)
-                line3d = np.array(line['camera']['track3d_trimmed'])
+                line2d = np.asarray(line['line2d'], dtype=np.float32)
+                line3d = np.asarray(line['camera']['track3d_trimmed'], dtype=np.float32)
+
+                projected = (camera_K @ line3d.T).T
+                projected = projected[:, :2] / projected[:, 2:3]
+                direct_error = np.abs(projected - line2d).sum()
+                swapped_error = np.abs(projected[::-1] - line2d).sum()
+                if swapped_error < direct_error:
+                    line3d = line3d[::-1].copy()
+
+                # Keep pixel coordinates through geometric transforms. Normalize once
+                # in the shared final Normalize transform.
+                lines2d.append(np.concatenate([line2d[0], line2d[1]]))
                 lines3d.append(np.concatenate([line3d[0], line3d[1]]))
-            return np.array(lines2d), np.array(lines3d)
+            return np.array(lines2d), np.array(lines3d), camera_K
         raise Exception('Didnt find usable lines type')
 
     def __len__(self):
@@ -344,6 +352,7 @@ class Monolines3D(torch.utils.data.Dataset):
         target['iscrowd'] = np.array([0 for _ in lines2d])
         target['lines'] = lines2d.astype(np.float32)
         target['lines3d'] = lines3d.astype(np.float32)
+        target['camera_K'] = entry['camera_K'].astype(np.float32)
         target['orig_size'] = np.array([h, w])
         target['size'] = np.array([h, w])
 
@@ -398,11 +407,10 @@ def make_coco_transforms(image_set, args=None):
     ts = [
         T.ToTensor(),
     ]
-    normalize_lines = args.mono3d_use_image_normalized_target_line_coords
     if args.mono3d_do_not_normalize_images is False:
-        ts.append(T.Normalize([0.538, 0.494, 0.453], [0.257, 0.263, 0.273], normalize_lines=normalize_lines))
+        ts.append(T.Normalize([0.538, 0.494, 0.453], [0.257, 0.263, 0.273]))
     else:
-        ts.append(T.Normalize([0.0, 0.0, 0.0], [1.0, 1.0, 1.0], normalize_lines=normalize_lines))
+        ts.append(T.Normalize([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]))
     normalize = T.Compose(ts)
 
 
