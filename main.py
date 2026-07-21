@@ -50,6 +50,9 @@ def get_args_parser():
                         help='start epoch')
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--num_workers', default=10, type=int)
+    parser.add_argument('--prefetch_factor', '--pretech_factor', dest='prefetch_factor', default=None, type=int)
+    parser.add_argument('--no_save_checkpoints', action='store_true')
+    parser.add_argument('--no_eval_during_train', action='store_true')
     parser.add_argument('--find_unused_params', action='store_true')
 
     # distributed training parameters
@@ -274,6 +277,15 @@ def create(args, classname):
     build_func = MODULE_BUILD_FUNCS.get(class_module)
     return build_func(args)
 
+
+def _dataloader_kwargs(args):
+    kwargs = {
+        'num_workers': args.num_workers,
+    }
+    if args.num_workers > 0 and args.prefetch_factor is not None:
+        kwargs['prefetch_factor'] = args.prefetch_factor
+    return kwargs
+
 def main(args):
     utils.init_distributed_mode(args)
     # load cfg file and update the args
@@ -309,6 +321,7 @@ def main(args):
         assert args.eval_spatial_size[0] == args.eval_spatial_size[1], 'We only support square shapes'
     save_run_metadata(args)
     device = torch.device(args.device)
+    dataloader_kwargs = _dataloader_kwargs(args)
 
     print(args)
 
@@ -339,7 +352,14 @@ def main(args):
         else:
             sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
-        data_loader_val = DataLoader(dataset_val, 64, sampler=sampler_val, drop_last=False, collate_fn=BatchImageCollateFunction(), num_workers=args.num_workers)
+        data_loader_val = DataLoader(
+            dataset_val,
+            64,
+            sampler=sampler_val,
+            drop_last=False,
+            collate_fn=BatchImageCollateFunction(),
+            **dataloader_kwargs,
+        )
     else:
         dataset_train = build_dataset(image_set='train', args=args)
         dataset_val = build_dataset(image_set='val', args=args)
@@ -363,14 +383,14 @@ def main(args):
                                         drop_last=True,
                                         collate_fn=collate_fn_train,
                                         # pin_memory=dataset_train.pin_memory,
-                                        num_workers=args.num_workers)
+                                        **dataloader_kwargs)
         data_loader_val = DataLoader(dataset_val, 
                                         args.batch_size_val, 
                                         sampler=sampler_val, 
                                         drop_last=False,
                                         collate_fn=collate_fn_val,
                                         # pin_memory=dataset_val.pin_memory,
-                                        num_workers=args.num_workers)
+                                        **dataloader_kwargs)
 
     # setup lr_drop_list
     if isinstance(args.lr_drop_list , int):
@@ -423,17 +443,14 @@ def main(args):
             model, criterion, data_loader_train, optimizer, device, epoch,
             args.clip_max_norm, lr_scheduler=lr_scheduler, warmup_scheduler=warmup_scheduler, 
             writer=writer, args=args)
-        if args.output_dir:
-            checkpoint_paths = [output_dir / 'checkpoint.pth']
-
         if warmup_scheduler is None or warmup_scheduler.finished():
             lr_scheduler.step()
         else:
             print(warmup_scheduler.last_step)
 
-        if args.output_dir:
+        if args.output_dir and not args.no_save_checkpoints:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
-            # extra checkpoint before LR drop and every 100 epochs
+            # Periodic numbered checkpoints are optional on top of the rolling latest checkpoint.
             if (epoch + 1) % args.save_checkpoint_interval == 0:
                 checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
             for checkpoint_path in checkpoint_paths:
@@ -447,10 +464,11 @@ def main(args):
                 }
                 utils.save_on_master(weights, checkpoint_path)
                 
-        # eval
-        test_stats = evaluate(
-            model, criterion, postprocessors, data_loader_val, device, args.output_dir, args=args
-        )
+        test_stats = {}
+        if not args.no_eval_during_train:
+            test_stats = evaluate(
+                model, criterion, postprocessors, data_loader_val, device, args.output_dir, args=args
+            )
 
         if utils.is_main_process():
             for k in test_stats:
