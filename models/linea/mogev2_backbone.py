@@ -10,6 +10,8 @@ def build_mogev2_backbone(args):
         def __init__(self):
             super().__init__()
 
+            self.num_tokens = getattr(args, 'mogev2bb_num_tokens', 1200)
+
             moge_args = {
                 'pretrained_model_name_or_path': args.mogev2bb_base_model,
                 'model_kwargs': {
@@ -26,7 +28,7 @@ def build_mogev2_backbone(args):
             self.backbone.encoder.backbone.mask_token.requires_grad = False
 
         def forward(self, images) -> List[torch.Tensor]:
-            features, _ = self.backbone(images)
+            features, _ = self.backbone(images, num_tokens=self.num_tokens)
             return features
 
     return Adapter()
