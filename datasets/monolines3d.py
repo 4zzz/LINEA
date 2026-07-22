@@ -121,14 +121,48 @@ def build_args(parser, required=None):
 
     parser.add_argument('--mono3d_dataset_root', type=str, **required_arg)
     parser.add_argument('--mono3d_preload_images', type=bool, default=False)
-    parser.add_argument('--mono3d_use_image_normalized_target_line_coords', action='store_true', default=False)
+    parser.add_argument(
+        '--mono3d_use_image_normalized_target_line_coords',
+        action='store_true',
+        default=False,
+        help='Deprecated compatibility option; 2D lines are normalized once after geometric transforms.',
+    )
     parser.add_argument('--mono3d_normalize_line_space', action='store_true', default=False)
     parser.add_argument('--mono3d_do_not_normalize_images', action='store_true', default=False)
     parser.add_argument('--mono3d_train2d', action='store_true', default=False)
     parser.add_argument('--mono3d_strict', action='store_true', default=False)
+    parser.add_argument(
+        '--mono3d_invalid_line_filter',
+        choices=('none', 'lines', 'samples'),
+        default='none',
+        help='Keep invalid geometry, remove invalid lines, or remove their entire samples.',
+    )
+    parser.add_argument('--mono3d_invalid_line_min_depth', type=float, default=1e-6)
+    parser.add_argument('--mono3d_invalid_line_min_length', type=float, default=1e-8)
+    parser.add_argument('--mono3d_invalid_line_max_abs_coordinate', type=float, default=1e6)
+    parser.add_argument('--mono3d_trim_3d_lines_to_2d', action='store_true', default=False)
+    parser.add_argument('--mono3d_record_3d_line_trimming', action='store_true', default=False)
 
 class Monolines3D(torch.utils.data.Dataset):
-    def __init__(self, root_dir, split, train2d, use_image_normalized_target_line_coords, normalize_3d_line_space, do_not_normalize_images, preload, strict, transforms=None, experiment_dir=None):
+    def __init__(
+        self,
+        root_dir,
+        split,
+        train2d,
+        use_image_normalized_target_line_coords,
+        normalize_3d_line_space,
+        do_not_normalize_images,
+        preload,
+        strict,
+        invalid_line_filter='none',
+        invalid_line_min_depth=1e-6,
+        invalid_line_min_length=1e-8,
+        invalid_line_max_abs_coordinate=1e6,
+        trim_3d_lines_to_2d=False,
+        record_3d_line_trimming=False,
+        transforms=None,
+        experiment_dir=None,
+    ):
         self.split = split
         self.train2d = train2d
         self.use_image_normalized_target_line_coords = use_image_normalized_target_line_coords
@@ -136,6 +170,17 @@ class Monolines3D(torch.utils.data.Dataset):
         self.do_not_normalize_images = do_not_normalize_images
         self.preload = preload
         self.transforms = transforms
+        if invalid_line_filter not in {'none', 'lines', 'samples'}:
+            raise ValueError(
+                "invalid_line_filter must be one of 'none', 'lines', or 'samples', "
+                f"got {invalid_line_filter!r}"
+            )
+        self.invalid_line_filter = invalid_line_filter
+        self.invalid_line_min_depth = invalid_line_min_depth
+        self.invalid_line_min_length = invalid_line_min_length
+        self.invalid_line_max_abs_coordinate = invalid_line_max_abs_coordinate
+        self.trim_3d_lines_to_2d = trim_3d_lines_to_2d
+        self.record_3d_line_trimming = record_3d_line_trimming
 
         dataset_root = Path(root_dir)
 
@@ -171,6 +216,31 @@ class Monolines3D(torch.utils.data.Dataset):
                 "used_images": [],
                 "missing_images": [],
                 "bad_annotations": [],
+                "filtered_lines": [],
+                "trimmed_lines": [],
+                "line_filtering": {
+                    "mode": self.invalid_line_filter,
+                    "thresholds": {
+                        "min_depth": self.invalid_line_min_depth,
+                        "min_length": self.invalid_line_min_length,
+                        "max_abs_coordinate": self.invalid_line_max_abs_coordinate,
+                    },
+                    "summary": {
+                        "affected_views": 0,
+                        "skipped_lines": 0,
+                        "skipped_views": 0,
+                    },
+                },
+                "line_trimming": {
+                    "enabled": self.trim_3d_lines_to_2d,
+                    "record_line_details": self.record_3d_line_trimming,
+                    "summary": {
+                        "affected_views": 0,
+                        "trimmed_lines": 0,
+                        "unchanged_lines": 0,
+                        "untrimmable_lines": 0,
+                    },
+                },
             }
 
             scene_image_counter = -1
@@ -214,11 +284,46 @@ class Monolines3D(torch.utils.data.Dataset):
                 loadable_image_path = image_path.resolve()
 
                 try:
-                     lines2d, lines3d, camera_K = self.resolve_target_lines(annotation)
+                    lines2d, lines3d, camera_K, filtering, trimming = self.resolve_target_lines(annotation)
                 except Exception as e:
                     msg = f"Could not resolve line targets for {image_path} ({e})"
                     scene_info["bad_annotations"].append(str(rel_annotation_path))
                     self._problem(msg)
+                    continue
+
+                if filtering['skipped_lines']:
+                    filtered_view = {
+                        "annotation": str(rel_annotation_path),
+                        "image": str(rel_image_path),
+                        **filtering,
+                    }
+                    scene_info["filtered_lines"].append(filtered_view)
+                    summary = scene_info["line_filtering"]["summary"]
+                    summary["affected_views"] += 1
+                    summary["skipped_lines"] += filtering['removed_line_count']
+                    summary["skipped_views"] += int(filtering['sample_skipped'])
+
+                if self.trim_3d_lines_to_2d:
+                    summary = scene_info["line_trimming"]["summary"]
+                    summary["trimmed_lines"] += trimming['trimmed_line_count']
+                    summary["unchanged_lines"] += trimming['unchanged_line_count']
+                    summary["untrimmable_lines"] += trimming['untrimmable_line_count']
+
+                if trimming['trimmed_line_count'] or trimming['untrimmable_line_count']:
+                    trimmed_view = {
+                        "annotation": str(rel_annotation_path),
+                        "image": str(rel_image_path),
+                        "trimmed_line_count": trimming['trimmed_line_count'],
+                        "unchanged_line_count": trimming['unchanged_line_count'],
+                        "untrimmable_line_count": trimming['untrimmable_line_count'],
+                    }
+                    if self.record_3d_line_trimming:
+                        trimmed_view["lines"] = trimming['lines']
+                    scene_info["trimmed_lines"].append(trimmed_view)
+                    summary = scene_info["line_trimming"]["summary"]
+                    summary["affected_views"] += 1
+
+                if filtering['sample_skipped']:
                     continue
 
                 entry = {
@@ -305,30 +410,194 @@ class Monolines3D(torch.utils.data.Dataset):
     def load_image(self, image_path):
         return Image.open(str(image_path)).convert("RGB")
 
-    def resolve_target_lines(self, annotation) -> Tuple[npt.NDArray[any], npt.NDArray[any], npt.NDArray[any]] | None:
-        img_size = np.array([annotation['img_file_width'], annotation['img_file_height']])
+    def _invalid_line_reasons(self, line2d, line3d):
+        reasons = []
+        if line2d.shape != (2, 2) or not np.isfinite(line2d).all():
+            reasons.append({
+                "code": "invalid_line2d",
+                "shape": list(line2d.shape),
+            })
+        if line3d.shape != (2, 3) or not np.isfinite(line3d).all():
+            reasons.append({
+                "code": "invalid_camera_line3d",
+                "shape": list(line3d.shape),
+            })
+            return reasons
+
+        length = float(np.linalg.norm(line3d[1] - line3d[0]))
+        if length <= self.invalid_line_min_length:
+            reasons.append({
+                "code": "degenerate_line3d",
+                "length": length,
+                "min_length": self.invalid_line_min_length,
+            })
+
+        invalid_depth_indices = np.flatnonzero(line3d[:, 2] <= self.invalid_line_min_depth)
+        if len(invalid_depth_indices):
+            reasons.append({
+                "code": "nonpositive_depth",
+                "endpoint_indices": invalid_depth_indices.tolist(),
+                "depths": line3d[invalid_depth_indices, 2].tolist(),
+                "min_depth": self.invalid_line_min_depth,
+            })
+
+        max_abs_coordinate = float(np.abs(line3d).max())
+        if max_abs_coordinate > self.invalid_line_max_abs_coordinate:
+            reasons.append({
+                "code": "extreme_camera_coordinate",
+                "max_abs_coordinate": max_abs_coordinate,
+                "limit": self.invalid_line_max_abs_coordinate,
+            })
+        return reasons
+
+    def _trim_3d_line_to_2d(self, line2d, line3d, camera_K):
+        projected_h = (camera_K @ line3d.T).T
+        projected = projected_h[:, :2] / projected_h[:, 2:3]
+        projected_delta = projected[1] - projected[0]
+        projected_length_squared = float(projected_delta @ projected_delta)
+        if not np.isfinite(projected_length_squared) or projected_length_squared <= 1e-12:
+            return line3d, {
+                "status": "untrimmable",
+                "reason": "degenerate_projected_line",
+            }
+
+        segment_parameters = np.array([
+            np.clip(
+                float((endpoint - projected[0]) @ projected_delta) / projected_length_squared,
+                0.0,
+                1.0,
+            )
+            for endpoint in line2d
+        ], dtype=np.float64)
+        closest_projected = projected[0] + segment_parameters[:, None] * projected_delta
+
+        # Image interpolation is not affine in 3D under perspective projection.
+        # Convert each image-segment parameter to its matching parameter on X(t).
+        z0, z1 = (float(line3d[0, 2]), float(line3d[1, 2]))
+        denominators = (1.0 - segment_parameters) * z1 + segment_parameters * z0
+        if not np.isfinite(denominators).all() or np.any(np.abs(denominators) <= 1e-12):
+            return line3d, {
+                "status": "untrimmable",
+                "reason": "invalid_perspective_parameter",
+                "segment_parameters": segment_parameters.tolist(),
+            }
+
+        line_parameters = segment_parameters * z0 / denominators
+        trimmed = line3d[0] + line_parameters[:, None] * (line3d[1] - line3d[0])
+        endpoint_errors = np.linalg.norm(closest_projected - line2d, axis=1)
+        trimmed_length = float(np.linalg.norm(trimmed[1] - trimmed[0]))
+        if trimmed_length <= getattr(self, 'invalid_line_min_length', 1e-8):
+            return line3d, {
+                "status": "untrimmable",
+                "reason": "collapsed_trim",
+                "segment_parameters": segment_parameters.tolist(),
+                "line_parameters": line_parameters.tolist(),
+                "endpoint_reprojection_distances": endpoint_errors.tolist(),
+            }
+
+        endpoint_movements = np.array([
+            min(np.linalg.norm(point - line3d[0]), np.linalg.norm(point - line3d[1]))
+            for point in trimmed
+        ])
+        changed = not np.allclose(np.sort(line_parameters), [0.0, 1.0], atol=1e-8)
+        return trimmed.astype(np.float32), {
+            "status": "trimmed" if changed else "unchanged",
+            "segment_parameters": segment_parameters.tolist(),
+            "line_parameters": line_parameters.tolist(),
+            "endpoint_3d_movements": endpoint_movements.tolist(),
+            "endpoint_reprojection_distances": endpoint_errors.tolist(),
+        }
+
+    def resolve_target_lines(
+        self,
+        annotation,
+    ) -> Tuple[npt.NDArray[any], npt.NDArray[any], npt.NDArray[any], dict, dict] | None:
         camera_K = np.array(annotation['camera']['K'], dtype=np.float32)
 
         if 'from_limap_tracks' in annotation['lines']:
             lines = annotation['lines']['from_limap_tracks']
             lines2d = []
             lines3d = []
-            for line in lines:
+            skipped_lines = []
+            trimming_lines = []
+            trimming_counts = {
+                "trimmed": 0,
+                "unchanged": 0,
+                "untrimmable": 0,
+            }
+            for line_index, line in enumerate(lines):
                 line2d = np.asarray(line['line2d'], dtype=np.float32)
                 line3d = np.asarray(line['camera']['track3d_trimmed'], dtype=np.float32)
 
-                projected = (camera_K @ line3d.T).T
-                projected = projected[:, :2] / projected[:, 2:3]
-                direct_error = np.abs(projected - line2d).sum()
-                swapped_error = np.abs(projected[::-1] - line2d).sum()
-                if swapped_error < direct_error:
-                    line3d = line3d[::-1].copy()
+                if self.invalid_line_filter != 'none':
+                    reasons = self._invalid_line_reasons(line2d, line3d)
+                    if reasons:
+                        skipped_lines.append({
+                            "line_index": line_index,
+                            "reasons": reasons,
+                        })
+                        continue
+
+                if self.trim_3d_lines_to_2d:
+                    line3d, trimming = self._trim_3d_line_to_2d(line2d, line3d, camera_K)
+                    trimming_counts[trimming['status']] += 1
+                    if self.record_3d_line_trimming:
+                        trimming_lines.append({
+                            "line_index": line_index,
+                            **trimming,
+                        })
+
+                    if trimming['status'] != 'untrimmable' and self.invalid_line_filter != 'none':
+                        reasons = self._invalid_line_reasons(line2d, line3d)
+                        if reasons:
+                            skipped_lines.append({
+                                "line_index": line_index,
+                                "stage": "after_trimming",
+                                "reasons": reasons,
+                            })
+                            continue
+
+                if not self.trim_3d_lines_to_2d or trimming['status'] == 'untrimmable':
+                    projected = (camera_K @ line3d.T).T
+                    projected = projected[:, :2] / projected[:, 2:3]
+                    direct_error = np.abs(projected - line2d).sum()
+                    swapped_error = np.abs(projected[::-1] - line2d).sum()
+                    if swapped_error < direct_error:
+                        line3d = line3d[::-1].copy()
 
                 # Keep pixel coordinates through geometric transforms. Normalize once
                 # in the shared final Normalize transform.
                 lines2d.append(np.concatenate([line2d[0], line2d[1]]))
                 lines3d.append(np.concatenate([line3d[0], line3d[1]]))
-            return np.array(lines2d), np.array(lines3d), camera_K
+
+            sample_skipped = bool(skipped_lines) and self.invalid_line_filter == 'samples'
+            sample_skip_reason = 'invalid_lines' if sample_skipped else None
+            if not lines2d and self.invalid_line_filter != 'none':
+                sample_skipped = True
+                sample_skip_reason = 'no_valid_lines_after_filtering'
+
+            filtering = {
+                "original_line_count": len(lines),
+                "valid_line_count": len(lines2d),
+                "kept_line_count": 0 if sample_skipped else len(lines2d),
+                "removed_line_count": len(lines) if sample_skipped else len(skipped_lines),
+                "skipped_lines": skipped_lines,
+                "sample_skipped": sample_skipped,
+                "sample_skip_reason": sample_skip_reason,
+            }
+            trimming = {
+                "trimmed_line_count": trimming_counts['trimmed'],
+                "unchanged_line_count": trimming_counts['unchanged'],
+                "untrimmable_line_count": trimming_counts['untrimmable'],
+                "lines": trimming_lines,
+            }
+            return (
+                np.asarray(lines2d, dtype=np.float32).reshape(-1, 4),
+                np.asarray(lines3d, dtype=np.float32).reshape(-1, 6),
+                camera_K,
+                filtering,
+                trimming,
+            )
         raise Exception('Didnt find usable lines type')
 
     def __len__(self):
@@ -479,6 +748,16 @@ def build_mono3d_from_args(image_set, args):
         "preload": args.mono3d_preload_images,
         "strict": args.mono3d_strict,
         "do_not_normalize_images": args.mono3d_do_not_normalize_images,
+        "invalid_line_filter": getattr(args, 'mono3d_invalid_line_filter', 'none'),
+        "invalid_line_min_depth": getattr(args, 'mono3d_invalid_line_min_depth', 1e-6),
+        "invalid_line_min_length": getattr(args, 'mono3d_invalid_line_min_length', 1e-8),
+        "invalid_line_max_abs_coordinate": getattr(
+            args,
+            'mono3d_invalid_line_max_abs_coordinate',
+            1e6,
+        ),
+        "trim_3d_lines_to_2d": getattr(args, 'mono3d_trim_3d_lines_to_2d', False),
+        "record_3d_line_trimming": getattr(args, 'mono3d_record_3d_line_trimming', False),
         "transforms": transforms,
         "experiment_dir": args.output_dir,
     }
