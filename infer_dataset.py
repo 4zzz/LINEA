@@ -11,6 +11,7 @@ from PIL import Image, ImageDraw
 from util.prediction_record import PredictionRecord, make_prediction_file, save, utc_timestamp
 from models.linea.matcher import build_matcher
 from models.linea.moge.utils.alignment import align_points_scale_xyz_shift, align_points_scale_z_shift
+from models.linea.line3d_alignment import fit_matched_lines3d_alignment
 
 def draw(images, lines, scores, thrh=0.4):
     for i, im in enumerate(images):
@@ -145,24 +146,35 @@ def _move_targets_to_device(targets, device):
     return [{k: v.to(device) if torch.is_tensor(v) else v for k, v in t.items()} for t in targets]
 
 
-def _align_points(src_pts, tgt_pts, alignment):
-    src_pts_flat = src_pts.reshape(1, -1, 3)
-    tgt_pts_flat = tgt_pts.reshape(1, -1, 3)
-    weight = torch.ones(src_pts_flat.shape[:2], dtype=src_pts_flat.dtype, device=src_pts_flat.device)
-
+def _fit_line3d_alignment(src_pts, tgt_pts, weight, alignment):
     if alignment == 'xyz_shift':
-        scale, shift = align_points_scale_xyz_shift(src_pts_flat, tgt_pts_flat, weight)
-    elif alignment == 'z_shift':
-        scale, shift = align_points_scale_z_shift(src_pts_flat, tgt_pts_flat, weight)
-    else:
-        raise ValueError(f"Unknown line3d_alignment value '{alignment}'.")
-
-    aligned = scale[:, None, None] * src_pts_flat + shift[:, None, :]
-    loss = torch.nn.functional.l1_loss(aligned, tgt_pts_flat, reduction='none').sum()
-    return scale.reshape(()), shift.reshape(3), loss
+        return align_points_scale_xyz_shift(src_pts, tgt_pts, weight)
+    if alignment == 'z_shift':
+        return align_points_scale_z_shift(src_pts, tgt_pts, weight)
+    raise ValueError(f"Unknown line3d_alignment value '{alignment}'.")
 
 
-def _fit_affine_lines3d(raw_outputs, targets, indices, alignment):
+def _line3d_regression_loss(src_pts, tgt_pts, loss_type, smooth_l1_beta):
+    if loss_type == 'l1':
+        return torch.nn.functional.l1_loss(src_pts, tgt_pts, reduction='none')
+    if loss_type == 'smooth_l1':
+        return torch.nn.functional.smooth_l1_loss(
+            src_pts,
+            tgt_pts,
+            reduction='none',
+            beta=smooth_l1_beta,
+        )
+    raise ValueError(f"Unknown line3d_loss_type '{loss_type}'.")
+
+
+def _fit_affine_lines3d(
+    raw_outputs,
+    targets,
+    indices,
+    alignment,
+    loss_type,
+    smooth_l1_beta,
+):
     if 'pred_lines3d' not in raw_outputs:
         return [None for _ in targets]
 
@@ -178,9 +190,18 @@ def _fit_affine_lines3d(raw_outputs, targets, indices, alignment):
         src_pts = sample_lines3d[src_idx].view(-1, 2, 3)
         tgt_pts = target['lines3d'][tgt_idx].view(-1, 2, 3)
 
-        direct_scale, direct_shift, direct_loss = _align_points(src_pts, tgt_pts, alignment)
-        swap_scale, swap_shift, swap_loss = _align_points(src_pts, tgt_pts[:, [1, 0], :], alignment)
-        scale, shift = (swap_scale, swap_shift) if swap_loss < direct_loss else (direct_scale, direct_shift)
+        scale, shift, _ = fit_matched_lines3d_alignment(
+            src_pts,
+            tgt_pts,
+            lambda src, tgt, weight: _fit_line3d_alignment(
+                src, tgt, weight, alignment
+            ),
+            lambda src, tgt: _line3d_regression_loss(
+                src, tgt, loss_type, smooth_l1_beta
+            ),
+        )
+        scale = scale.reshape(())
+        shift = shift.reshape(3)
 
         fitted.append((scale * sample_lines3d.view(-1, 2, 3) + shift).view(-1, 6))
 
@@ -276,6 +297,8 @@ with torch.no_grad():
                 targets_device,
                 indices,
                 getattr(model_args, 'line3d_alignment', 'xyz_shift'),
+                getattr(model_args, 'line3d_loss_type', 'l1'),
+                getattr(model_args, 'line3d_smooth_l1_beta', 1.0),
             )
         else:
             fitted_lines3d = None
