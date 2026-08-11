@@ -280,7 +280,8 @@ class TransformerEncoderLayer(nn.Module):
         src, _ = self.self_attn(q, k, 
             value=src, 
             attn_mask=src_mask,
-            key_padding_mask=src_key_padding_mask)
+            key_padding_mask=src_key_padding_mask,
+            need_weights=False)
 
         src = residual + self.dropout1(src)
         if not self.normalize_before:

@@ -9,6 +9,8 @@ def wrap_module_with_gradient_checkpointing(module: nn.Module):
     class _CheckpointingWrapper(module.__class__):
         _restore_cls = module.__class__
         def forward(self, *args, **kwargs):
+            if not self.training or not torch.is_grad_enabled():
+                return super().forward(*args, **kwargs)
             return checkpoint(super().forward, *args, use_reentrant=False, **kwargs)
         
     module.__class__ = _CheckpointingWrapper

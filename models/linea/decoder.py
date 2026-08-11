@@ -98,7 +98,13 @@ class DeformableTransformerDecoderLayer(nn.Module):
             ):
         # self attention
         q = k = self.with_pos_embed(tgt, tgt_query_pos)
-        tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
+        tgt2 = self.self_attn(
+            q,
+            k,
+            tgt,
+            attn_mask=self_attn_mask,
+            need_weights=False,
+        )[0]
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
 

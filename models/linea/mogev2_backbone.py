@@ -24,6 +24,8 @@ def build_mogev2_backbone(args):
                 moge_args['neck_config_override'] = neck_cfg
 
             self.backbone = MoGeV2BB.from_pretrained(**moge_args)
+            if getattr(args, 'mogev2bb_gradient_checkpointing', False):
+                self.backbone.enable_gradient_checkpointing()
             # TODO: temporary workaround
             self.backbone.encoder.backbone.mask_token.requires_grad = False
 
