@@ -735,7 +735,7 @@ def build_mono3d_from_conf(conf):
     return Monolines3D(**conf)
 
 
-def build_mono3d_from_args(image_set, args):
+def build_mono3d_from_args(image_set, args, experiment_dir=None):
 
     transforms = make_coco_transforms(image_set, args)
 
@@ -759,7 +759,7 @@ def build_mono3d_from_args(image_set, args):
         "trim_3d_lines_to_2d": getattr(args, 'mono3d_trim_3d_lines_to_2d', False),
         "record_3d_line_trimming": getattr(args, 'mono3d_record_3d_line_trimming', False),
         "transforms": transforms,
-        "experiment_dir": args.output_dir,
+        "experiment_dir": experiment_dir,
     }
     return Monolines3D(**conf)
 
