@@ -217,10 +217,12 @@ class TransformerDecoder(nn.Module):
         self.pred_3d = pred_3d
         self.line3d_pred_strategy = line3d_pred_strategy
         self.line3d_decoder_mode = line3d_decoder_mode
-        if self.line3d_decoder_mode not in ('independent', 'refline3d'):
+        if self.line3d_decoder_mode not in ('independent', 'refline3d', 'refline3d_conditioned'):
             raise ValueError(
                 f"Unknown line3d_decoder_mode value '{self.line3d_decoder_mode}'."
             )
+        self.uses_refline3d = self.line3d_decoder_mode in ('refline3d', 'refline3d_conditioned')
+        self.conditions_on_refline3d = self.line3d_decoder_mode == 'refline3d_conditioned'
         if self.pred_3d:
             line3d_output_dim = 6 if self.line3d_pred_strategy == 'direct' else 2
             _line3d_embed = MLP(d_model, d_model, line3d_output_dim, 3)
@@ -235,6 +237,11 @@ class TransformerDecoder(nn.Module):
                     _inverse_softplus(max(line3d_uv_depth_init_depth - 1e-3, 1e-6)),
                 )
             self.line3d_embed = nn.ModuleList([copy.deepcopy(_line3d_embed) for _ in range(num_layers)])
+            if self.conditions_on_refline3d:
+                _line3d_state_embed = MLP(line3d_output_dim, d_model, d_model, 2)
+                self.line3d_state_embed = nn.ModuleList(
+                    [copy.deepcopy(_line3d_state_embed) for _ in range(num_layers)]
+                )
 
         self.aux_loss = aux_loss
 
@@ -300,9 +307,11 @@ class TransformerDecoder(nn.Module):
         dec_out_lines3d = []
         dec_out_logits = []
 
-        if self.pred_3d and self.line3d_decoder_mode == 'refline3d':
+        if self.pred_3d and self.uses_refline3d:
             if refline3d is None:
-                raise ValueError("line3d_decoder_mode='refline3d' requires an initial refline3d state.")
+                raise ValueError(
+                    f"line3d_decoder_mode='{self.line3d_decoder_mode}' requires an initial refline3d state."
+                )
             line3d_state = refline3d
 
         if not hasattr(self, 'project'):
@@ -336,8 +345,13 @@ class TransformerDecoder(nn.Module):
             inter_ref_bbox = distance2bbox(ref_points_initial, self.integral(pred_corners, project), self.reg_scale) 
 
             if self.pred_3d:
-                line3d_update = self.line3d_embed[layer_id](output)
-                if self.line3d_decoder_mode == 'refline3d':
+                line3d_head_input = output
+                if self.conditions_on_refline3d:
+                    line3d_head_input = (
+                        line3d_head_input + self.line3d_state_embed[layer_id](line3d_state)
+                    )
+                line3d_update = self.line3d_embed[layer_id](line3d_head_input)
+                if self.uses_refline3d:
                     pred_line3d = line3d_state + line3d_update
                 else:
                     pred_line3d = line3d_update
@@ -354,12 +368,12 @@ class TransformerDecoder(nn.Module):
             if self.training:
                 ref_points_detach = inter_ref_bbox.detach() 
                 output_detach = output.detach()
-                if self.pred_3d and self.line3d_decoder_mode == 'refline3d':
+                if self.pred_3d and self.uses_refline3d:
                     line3d_state = pred_line3d.detach()
             else:
                 ref_points_detach = inter_ref_bbox
                 output_detach = output
-                if self.pred_3d and self.line3d_decoder_mode == 'refline3d':
+                if self.pred_3d and self.uses_refline3d:
                     line3d_state = pred_line3d
 
         if self.pred_3d:
@@ -449,6 +463,7 @@ class LINEATransformer(nn.Module):
         self.pred_3d = pred_3d
         self.line3d_pred_strategy = line3d_pred_strategy
         self.line3d_decoder_mode = line3d_decoder_mode
+        self.uses_refline3d = self.line3d_decoder_mode in ('refline3d', 'refline3d_conditioned')
         if self.pred_3d:
             line3d_output_dim = 6 if self.line3d_pred_strategy == 'direct' else 2
             _line3d_embed = MLP(d_model, d_model, line3d_output_dim, 3)
@@ -581,9 +596,9 @@ class LINEATransformer(nn.Module):
         refpoint_embed_undetach = self.enc_out_bbox_embed(selected_output_memory) + selected_output_proposals # (bs, \sum{hw}, 4) unsigmoid
         refpoint_embed = refpoint_embed_undetach.detach()
 
-        if self.pred_3d and (self.training or self.line3d_decoder_mode == 'refline3d'):
+        if self.pred_3d and (self.training or self.uses_refline3d):
             out_lines3d_enc_params = self.enc_out_line3d_embed(selected_output_memory)
-            if self.line3d_decoder_mode == 'refline3d':
+            if self.uses_refline3d:
                 refline3d_params = out_lines3d_enc_params.detach()
 
         # gather tgt
@@ -598,7 +613,7 @@ class LINEATransformer(nn.Module):
                                 hidden_dim=self.d_model, label_enc=self.label_enc)
             tgt = torch.cat([dn_tgt, tgt.transpose(0, 1)], dim=1).transpose(0, 1)
             refpoint_embed = torch.cat([dn_refpoint_embed, refpoint_embed], dim=1)
-            if self.pred_3d and self.line3d_decoder_mode == 'refline3d':
+            if self.pred_3d and self.uses_refline3d:
                 init_bias = self.enc_out_line3d_embed.layers[-1].bias.detach()
                 dn_refline3d_params = init_bias.view(1, 1, -1).expand(
                     bs, dn_meta['pad_size'], -1
@@ -616,7 +631,7 @@ class LINEATransformer(nn.Module):
                 pos=None,
                 refpoints_unsigmoid=refpoint_embed.transpose(0, 1), 
                 refline3d=refline3d_params.transpose(0, 1)
-                if (self.pred_3d and self.line3d_decoder_mode == 'refline3d') else None,
+                if (self.pred_3d and self.uses_refline3d) else None,
                 spatial_shapes=spatial_shapes,
                 tgt_mask=dn_attn_mask)
         
