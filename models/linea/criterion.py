@@ -53,6 +53,21 @@ class LINEACriterion(nn.Module):
         self.line3d_loss_type = line3d_loss_type
         self.line3d_smooth_l1_beta = line3d_smooth_l1_beta
         self.line3d_z_loss_type = line3d_z_loss_type
+        self.unscaled_loss_dict = {}
+
+    def _reset_unscaled_losses(self):
+        self.unscaled_loss_dict = {}
+
+    def _weight_losses(self, losses, suffix=''):
+        """Record raw losses for logging, then apply their configured weights."""
+        weighted_losses = {}
+        for name, value in losses.items():
+            if name not in self.weight_dict:
+                continue
+            output_name = f'{name}{suffix}'
+            self.unscaled_loss_dict[output_name] = value.detach()
+            weighted_losses[output_name] = value * self.weight_dict[name]
+        return weighted_losses
 
     def loss_labels(self, outputs, targets, indices, num_boxes):
         """Classification loss (Binary focal loss)
@@ -258,6 +273,7 @@ class LINEACriterion(nn.Module):
         indices = self.matcher(outputs_without_aux, targets)
         if return_indices:
             return indices
+        self._reset_unscaled_losses()
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_boxes = sum(len(t["labels"]) for t in targets)
@@ -273,7 +289,7 @@ class LINEACriterion(nn.Module):
             indices_in = indices
             num_boxes_in = num_boxes
             l_dict = self.get_loss(loss, outputs, targets, indices_in, num_boxes_in)
-            l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
+            l_dict = self._weight_losses(l_dict)
             losses.update(l_dict)
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
@@ -282,8 +298,7 @@ class LINEACriterion(nn.Module):
                 indices = self.matcher(aux_outputs, targets)
                 for loss in self.losses:      
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes)
-                    l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
-                    l_dict = {k + f'_{idx}': v for k, v in l_dict.items()}
+                    l_dict = self._weight_losses(l_dict, suffix=f'_{idx}')
                     losses.update(l_dict)
 
         # interm_outputs loss
@@ -292,8 +307,7 @@ class LINEACriterion(nn.Module):
             indices = self.matcher(interm_outputs, targets)
             for loss in self.losses:
                 l_dict = self.get_loss(loss, interm_outputs, targets, indices, num_boxes)
-                l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
-                l_dict = {k + f'_interm': v for k, v in l_dict.items()}
+                l_dict = self._weight_losses(l_dict, suffix='_interm')
                 losses.update(l_dict)
 
         # pre output loss
@@ -302,8 +316,7 @@ class LINEACriterion(nn.Module):
             indices = self.matcher(pre_outputs, targets)
             for loss in self.losses:
                 l_dict = self.get_loss(loss, pre_outputs, targets, indices, num_boxes)
-                l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
-                l_dict = {k + f'_pre': v for k, v in l_dict.items()}
+                l_dict = self._weight_losses(l_dict, suffix='_pre')
                 losses.update(l_dict)
 
         # prepare for dn loss
@@ -333,8 +346,7 @@ class LINEACriterion(nn.Module):
                 for idx, aux_outputs in enumerate(dn_outputs['aux_outputs']):
                     for loss in self.losses:
                         l_dict = self.get_loss(loss, aux_outputs, targets, dn_pos_idx, num_boxes*scalar)
-                        l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
-                        l_dict = {k + f'_dn_{idx}': v for k, v in l_dict.items()}
+                        l_dict = self._weight_losses(l_dict, suffix=f'_dn_{idx}')
                         losses.update(l_dict)
 
             if 'aux_pre_outputs' in dn_outputs:
@@ -342,8 +354,7 @@ class LINEACriterion(nn.Module):
                 l_dict={}
                 for loss in self.losses:
                     l_dict.update(self.get_loss(loss, aux_outputs_known, targets, dn_pos_idx, num_boxes*scalar))
-                l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}  
-                l_dict = {k + f'_pre_dn': v for k, v in l_dict.items()}
+                l_dict = self._weight_losses(l_dict, suffix='_pre_dn')
                 losses.update(l_dict)
 
         losses = {k: v for k, v in sorted(losses.items(), key=lambda item: item[0])}
@@ -483,6 +494,7 @@ class DFINESetCriterion(LINEACriterion):
         indices = self.matcher(outputs_without_aux, targets)
 
         self._clear_cache()
+        self._reset_unscaled_losses()
 
         # Get the matching union set across all decoder layers.
         if 'aux_outputs' in outputs:
@@ -526,7 +538,7 @@ class DFINESetCriterion(LINEACriterion):
             indices_in = indices_go if loss in ['lines', 'local'] else indices
             num_boxes_in = num_boxes_go if loss in ['lines', 'local'] else num_boxes
             l_dict = self.get_loss(loss, outputs, targets, indices_in, num_boxes_in)
-            l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
+            l_dict = self._weight_losses(l_dict)
             losses.update(l_dict)
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
@@ -538,8 +550,7 @@ class DFINESetCriterion(LINEACriterion):
                     indices_in = indices_go if loss in ['lines', 'local'] else cached_indices[idx]
                     num_boxes_in = num_boxes_go if loss in ['lines', 'local'] else num_boxes
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices_in, num_boxes_in)
-                    l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
-                    l_dict = {k + f'_{idx}': v for k, v in l_dict.items()}
+                    l_dict = self._weight_losses(l_dict, suffix=f'_{idx}')
                     losses.update(l_dict)
 
         # interm_outputs loss
@@ -550,8 +561,7 @@ class DFINESetCriterion(LINEACriterion):
                 indices_in = indices_go if loss in ['lines', 'local'] else cached_indices_enc[0]
                 num_boxes_in = num_boxes_go if loss in ['lines', 'local'] else num_boxes
                 l_dict = self.get_loss(loss, interm_outputs, targets, indices_in, num_boxes_in)
-                l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
-                l_dict = {k + f'_interm': v for k, v in l_dict.items()}
+                l_dict = self._weight_losses(l_dict, suffix='_interm')
                 losses.update(l_dict)
 
         # pre output loss
@@ -562,8 +572,7 @@ class DFINESetCriterion(LINEACriterion):
                 indices_in = indices_go if loss in ['lines', 'local'] else cached_indices[-1]
                 num_boxes_in = num_boxes_go if loss in ['lines', 'local'] else num_boxes
                 l_dict = self.get_loss(loss, pre_outputs, targets, indices_in, num_boxes_in)
-                l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
-                l_dict = {k + f'_pre': v for k, v in l_dict.items()}
+                l_dict = self._weight_losses(l_dict, suffix='_pre')
                 losses.update(l_dict)
 
 
@@ -598,8 +607,7 @@ class DFINESetCriterion(LINEACriterion):
                     # indices = self.matcher(aux_outputs, targets)
                     for loss in self.losses:
                         l_dict = self.get_loss(loss, aux_outputs, targets, dn_pos_idx, num_boxes*scalar)
-                        l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
-                        l_dict = {k + f'_dn_{idx}': v for k, v in l_dict.items()}
+                        l_dict = self._weight_losses(l_dict, suffix=f'_dn_{idx}')
                         losses.update(l_dict)
 
             if 'aux_pre_outputs' in dn_outputs:
@@ -607,14 +615,12 @@ class DFINESetCriterion(LINEACriterion):
                 l_dict={}
                 for loss in self.losses:
                     l_dict.update(self.get_loss(loss, aux_outputs_known, targets, dn_pos_idx, num_boxes*scalar))
-                l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}  
-                l_dict = {k + f'_pre_dn': v for k, v in l_dict.items()}
+                l_dict = self._weight_losses(l_dict, suffix='_pre_dn')
                 losses.update(l_dict)
 
         if 'aux_lmap' in outputs:
             l_dict = self.get_loss('lmap', outputs, targets, indices, num_boxes, **kwargs)
-            l_dict = {k: v for k, v in l_dict.items()}
-            l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}  
+            l_dict = self._weight_losses(l_dict)
             losses.update(l_dict)
 
         losses = {k: v for k, v in sorted(losses.items(), key=lambda item: item[0])}

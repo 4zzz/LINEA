@@ -50,6 +50,13 @@ def _update_loss_weight_meters(metric_logger, criterion):
         metric_logger.update(**{meter_name: value})
 
 
+def _get_raw_loss_dict(criterion):
+    return {
+        f'{name}_raw': value
+        for name, value in getattr(criterion, 'unscaled_loss_dict', {}).items()
+    }
+
+
 def _collect_line3d_depth_stats(outputs, targets):
     if 'pred_line_depths' not in outputs:
         return {}
@@ -104,11 +111,14 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
         # reduce losses over all GPUs for logging purposes
         loss_dict_reduced = utils.reduce_dict(loss_dict)
+        raw_loss_dict_reduced = utils.reduce_dict(_get_raw_loss_dict(criterion))
         depth_stats = _collect_line3d_depth_stats(outputs, targets)
         depth_stats_reduced = utils.reduce_dict(depth_stats) if depth_stats else {}
         losses_reduced_scaled = sum(loss_dict_reduced.values())
+        losses_reduced_raw = sum(raw_loss_dict_reduced.values())
 
         loss_value = losses_reduced_scaled.item()
+        raw_loss_value = losses_reduced_raw.item()
 
         if not math.isfinite(loss_value):
             print("Loss is {}, stopping training".format(loss_value))
@@ -139,17 +149,25 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             if epoch >= args.ema_epoch:
                 ema_m.update(model)
 
-        metric_logger.update(loss=loss_value, **loss_dict_reduced)
+        metric_logger.update(
+            loss=loss_value,
+            loss_raw=raw_loss_value,
+            **loss_dict_reduced,
+            **raw_loss_dict_reduced,
+        )
         if depth_stats_reduced:
             metric_logger.update(**{k: v.item() for k, v in depth_stats_reduced.items()})
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
         if writer and utils.is_main_process() and global_step % 10 == 0:
             writer.add_scalar('Loss/total', loss_value, global_step)
+            writer.add_scalar('LossRaw/total', raw_loss_value, global_step)
             for j, pg in enumerate(optimizer.param_groups):
                 writer.add_scalar(f'Lr/pg_{j}', pg['lr'], global_step)
             for k, v in loss_dict_reduced.items():
                 writer.add_scalar(f'Loss/{k}', v.item(), global_step)
+            for k, v in raw_loss_dict_reduced.items():
+                writer.add_scalar(f'LossRaw/{k.removesuffix("_raw")}', v.item(), global_step)
             for k, v in depth_stats_reduced.items():
                 writer.add_scalar(f'Depth/{k}', v.item(), global_step)
             for name, value in criterion.weight_dict.items():
@@ -183,10 +201,16 @@ def evaluate(model, criterion, postprocessors, data_loader, device, output_dir, 
 
         # reduce losses over all GPUs for logging purposes
         loss_dict_reduced = utils.reduce_dict(loss_dict)
+        raw_loss_dict_reduced = utils.reduce_dict(_get_raw_loss_dict(criterion))
         depth_stats = _collect_line3d_depth_stats(outputs, targets)
         depth_stats_reduced = utils.reduce_dict(depth_stats) if depth_stats else {}
-        metric_logger.update(loss=sum(loss_dict_reduced.values()),
-                             **loss_dict_reduced,)
+        _update_loss_weight_meters(metric_logger, criterion)
+        metric_logger.update(
+            loss=sum(loss_dict_reduced.values()),
+            loss_raw=sum(raw_loss_dict_reduced.values()),
+            **loss_dict_reduced,
+            **raw_loss_dict_reduced,
+        )
         if depth_stats_reduced:
             metric_logger.update(**{k: v.item() for k, v in depth_stats_reduced.items()})
         
