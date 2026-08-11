@@ -18,6 +18,12 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from util.get_param_dicts import get_optim_params
 from util.slconfig import DictAction, SLConfig
+from util.experiment_tags import (
+    resolve_experiment_text,
+    validate_tags,
+    write_experiment_tags,
+    write_experiment_text_metadata,
+)
 from util.profiler import stats
 import util.misc as utils
 
@@ -26,6 +32,9 @@ from engine import train_one_epoch, evaluate, test
 
 from tensorboardX import SummaryWriter
 from warmup import LinearWarmup
+
+
+CODEBASE_NAME = 'linea'
 
 
 def get_args_parser():
@@ -64,6 +73,28 @@ def get_args_parser():
     parser.add_argument('--amp', action='store_true',
                         help="Train with mixed precision")
     parser.add_argument('--print_freq', default=500, type=int, help='number of distributed processes')
+    parser.add_argument(
+        '--experiment-tags',
+        '--experiment_tags',
+        dest='_cli_experiment_tags',
+        nargs='+',
+        default=None,
+        help='custom lowercase tags to add to experiment_tags.json',
+    )
+    parser.add_argument(
+        '--experiment-name',
+        '--experiment_name',
+        dest='_cli_experiment_name',
+        default=None,
+        help='human-readable name written to experiment_name.txt',
+    )
+    parser.add_argument(
+        '--experiment-description',
+        '--experiment_description',
+        dest='_cli_experiment_description',
+        default=None,
+        help='description written to experiment_description.txt',
+    )
 
     return parser
 
@@ -85,7 +116,7 @@ def _json_safe(value):
 
 
 def _git_metadata():
-    metadata = {}
+    metadata = {'name': CODEBASE_NAME}
     commands = {
         'commit': ['git', 'rev-parse', 'HEAD'],
         'branch': ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
@@ -264,9 +295,17 @@ def save_run_metadata(args):
 
     with open(output_dir / 'codebase.json', 'w') as f:
         json.dump(_git_metadata(), f, indent=2, sort_keys=True)
+    (output_dir / 'codebase_name.txt').write_text(CODEBASE_NAME + '\n', encoding='utf-8')
 
     with open(output_dir / 'machine.json', 'w') as f:
         json.dump(_machine_metadata(), f, indent=2, sort_keys=True)
+
+    write_experiment_tags(output_dir, args)
+    write_experiment_text_metadata(
+        output_dir,
+        name=getattr(args, 'experiment_name', None),
+        description=getattr(args, 'experiment_description', None),
+    )
 
 
 def create(args, classname):
@@ -302,6 +341,24 @@ def main(args):
             setattr(args, k, v)
         else:
             raise ValueError("Key {} can used by args only".format(k))
+
+    config_tags = validate_tags(getattr(args, 'experiment_tags', []))
+    cli_tags = validate_tags(getattr(args, '_cli_experiment_tags', []))
+    args.experiment_tags = sorted(set(config_tags) | set(cli_tags))
+    del args._cli_experiment_tags
+    args.experiment_name = resolve_experiment_text(
+        getattr(args, 'experiment_name', None),
+        args._cli_experiment_name,
+        'experiment_name',
+    )
+    args.experiment_description = resolve_experiment_text(
+        getattr(args, 'experiment_description', None),
+        args._cli_experiment_description,
+        'experiment_description',
+        multiline=True,
+    )
+    del args._cli_experiment_name
+    del args._cli_experiment_description
 
     # setup tensorboar writer
     if not args.eval:
