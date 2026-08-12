@@ -410,6 +410,7 @@ class LINEATransformer(nn.Module):
         reg_max=32,
         reg_scale=4,
         # denoising
+        use_dn=True,
         dn_number=100,
         dn_label_noise_ratio=0.5,
         dn_line_noise_scale=0.5,
@@ -494,6 +495,7 @@ class LINEATransformer(nn.Module):
 
 
         # denoising parameters
+        self.use_dn = use_dn
         self.dn_number = dn_number
         self.dn_label_noise_ratio = dn_label_noise_ratio
         self.dn_line_noise_scale = dn_line_noise_scale
@@ -612,7 +614,7 @@ class LINEATransformer(nn.Module):
         tgt = self.tgt_embed.weight[:, None, :].repeat(1, bs, 1)  # nq, bs, d_model
 
         # denoise (only for training)
-        if self.training and targets is not None:
+        if self.use_dn and self.training and targets is not None:
             dn_tgt, dn_refpoint_embed, dn_attn_mask, dn_meta =\
                 prepare_for_cdn(dn_args=(targets, self.dn_number, self.dn_label_noise_ratio, self.dn_line_noise_scale),
                                 training=self.training,num_queries=self.num_queries, num_classes=self.num_classes,
@@ -774,6 +776,7 @@ def build_decoder(args):
             eval_spatial_size=args.eval_spatial_size,
             eval_idx=args.eval_idx,
             # for denoising
+            use_dn=getattr(args, 'use_dn', True),
             dn_number=args.dn_number,
             dn_label_noise_ratio=args.dn_label_noise_ratio,
             dn_line_noise_scale=args.dn_line_noise_scale,
