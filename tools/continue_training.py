@@ -199,6 +199,13 @@ def checkpoint_epoch_hint(checkpoint: Path, last_logged_epoch: int | None) -> in
     return None
 
 
+def checkpoint_has_warmup_state(checkpoint: Path) -> bool:
+    import torch
+
+    value = torch.load(checkpoint, map_location="cpu", weights_only=False, mmap=True)
+    return isinstance(value, dict) and value.get("warmup_scheduler") is not None
+
+
 def load_merged_config(config: Path, overrides: dict[str, Any]) -> dict[str, Any]:
     cfg = SLConfig.fromfile(str(config))
     if overrides:
@@ -247,12 +254,13 @@ def validate_continuation(
     changes: dict[str, dict[str, Any]],
     runtime_changes: dict[str, dict[str, Any]],
     last_logged_epoch: int | None,
+    warmup_state_available: bool | None = None,
 ) -> None:
-    if merged_config.get("use_warmup", False):
+    if merged_config.get("use_warmup", False) and warmup_state_available is not True:
         raise ContinuationError(
-            "Safe continuation with use_warmup=True is not supported because main.py "
-            "does not currently restore the saved warmup-scheduler state. Resume after "
-            "setting use_warmup=false in a new output directory, or add warmup restoration first."
+            "Safe continuation with use_warmup=True requires a checkpoint containing "
+            "warmup-scheduler state (warmup_scheduler). Select a compatible checkpoint or resume after "
+            "setting use_warmup=false in a new output directory."
         )
 
     structural_changes = sorted(STRUCTURAL_CONFIG_KEYS.intersection(changes))
@@ -556,6 +564,9 @@ def run(cli_args: list[str] | None = None) -> int:
     changes = changed_config_values(saved_args, merged_config)
     runtime_changes = changed_runtime_values(args, saved_args)
     last_logged_epoch = read_last_logged_epoch(source_output)
+    warmup_state_available = None
+    if merged_config.get("use_warmup", False):
+        warmup_state_available = checkpoint_has_warmup_state(checkpoint)
 
     ensure_destination(source_output, destination)
     validate_continuation(
@@ -567,6 +578,7 @@ def run(cli_args: list[str] | None = None) -> int:
         changes=changes,
         runtime_changes=runtime_changes,
         last_logged_epoch=last_logged_epoch,
+        warmup_state_available=warmup_state_available,
     )
 
     command = build_command(
