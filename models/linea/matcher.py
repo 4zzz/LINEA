@@ -35,8 +35,10 @@ def _finite_summary(name, tensor):
 def _compute_costs(matcher, outputs, targets):
     """Return the exact per-image cost components used by the matcher."""
     bs, num_queries = outputs["pred_logits"].shape[:2]
-    out_prob = outputs["pred_logits"].flatten(0, 1).sigmoid()
-    out_line = outputs["pred_lines"].flatten(0, 1)
+    # Matching does not need gradients. Keep its probability and distance
+    # calculations in FP32 so autocast cannot saturate sigmoid to exactly 0/1.
+    out_prob = outputs["pred_logits"].flatten(0, 1).float().sigmoid()
+    out_line = outputs["pred_lines"].flatten(0, 1).float()
 
     sizes = [len(target["lines"]) for target in targets]
     if sum(sizes) == 0:
@@ -55,7 +57,7 @@ def _compute_costs(matcher, outputs, targets):
         ]
 
     tgt_ids = torch.cat([target["labels"] for target in targets])
-    tgt_line = torch.cat([target["lines"] for target in targets])
+    tgt_line = torch.cat([target["lines"] for target in targets]).float()
 
     alpha = matcher.focal_alpha
     gamma = 2.0
