@@ -31,6 +31,13 @@ def _finite_summary(name, tensor):
     return f"{name}: finite=0/{tensor.numel()}"
 
 
+def _nonfinite_batch_indices(tensor):
+    if tensor.ndim == 0:
+        return [0] if not torch.isfinite(tensor) else []
+    finite_per_sample = torch.isfinite(tensor).flatten(1).all(dim=1)
+    return (~finite_per_sample).nonzero(as_tuple=False).flatten().cpu().tolist()
+
+
 @torch.no_grad()
 def _compute_costs(matcher, outputs, targets):
     """Return the exact per-image cost components used by the matcher."""
@@ -74,6 +81,11 @@ def _compute_costs(matcher, outputs, targets):
             target.get("image_id", torch.tensor([-1])).detach().cpu().flatten().tolist()
             for target in targets
         ]
+        invalid_batch_indices = sorted(set(
+            _nonfinite_batch_indices(outputs["pred_logits"])
+            + _nonfinite_batch_indices(outputs["pred_lines"])
+        ))
+        invalid_image_ids = [image_ids[index] for index in invalid_batch_indices]
         raise ValueError(
             "matcher cost matrix contains non-finite values; "
             + "; ".join([
@@ -83,6 +95,8 @@ def _compute_costs(matcher, outputs, targets):
                 _finite_summary("cost_class", cost_class),
                 _finite_summary("cost_line", cost_line),
                 _finite_summary("cost", total),
+                f"invalid_batch_indices={invalid_batch_indices}",
+                f"invalid_image_ids={invalid_image_ids}",
                 f"target_sizes={sizes}",
                 f"image_ids={image_ids}",
             ])
