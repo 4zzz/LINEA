@@ -10,7 +10,43 @@
 
 import torch
 from .linea_utils import inverse_sigmoid
-import torch.nn.functional as F
+
+
+def _canonicalize_line_endpoints(lines):
+    """Order endpoints consistently with the dataset transforms."""
+    lines = lines.clone()
+    swap = torch.logical_or(
+        lines[..., 0] > lines[..., 2],
+        torch.logical_and(
+            lines[..., 0] == lines[..., 2],
+            lines[..., 1] > lines[..., 3],
+        ),
+    )
+    lines[swap] = lines[swap][:, [2, 3, 0, 1]]
+    return lines
+
+
+def _add_line_noise(lines, negative_idx, noise_scale):
+    """Perturb each endpoint around its target by up to half the line vector."""
+    half_vector = torch.zeros_like(lines)
+    half_vector[:, :2] = (lines[:, 2:] - lines[:, :2]) / 2
+    half_vector[:, 2:] = half_vector[:, :2]
+
+    rand_sign = torch.randint(
+        0, 2, (lines.shape[0], 2), dtype=lines.dtype, device=lines.device
+    ) * 2.0 - 1.0
+    rand_part = torch.rand(
+        (lines.shape[0], 2), dtype=lines.dtype, device=lines.device
+    )
+    rand_part[negative_idx] += 1.2
+    rand_part *= rand_sign
+
+    noisy_lines = (
+        lines
+        + rand_part.repeat_interleave(2, dim=1) * half_vector * noise_scale
+    )
+    return _canonicalize_line_endpoints(noisy_lines.clamp(min=0.0, max=1.0))
+
 
 def prepare_for_cdn(dn_args, training, num_queries, num_classes, hidden_dim, label_enc):
     """
@@ -26,9 +62,10 @@ def prepare_for_cdn(dn_args, training, num_queries, num_classes, hidden_dim, lab
         """
     if training:
         targets, dn_number, label_noise_ratio, box_noise_scale = dn_args
+        device = targets[0]['labels'].device
         # positive and negative dn queries
         dn_number = dn_number * 2
-        known = [(torch.ones_like(t['labels'])).cuda() for t in targets]
+        known = [torch.ones_like(t['labels']) for t in targets]
         batch_size = len(known)
         known_num = [sum(k) for k in known]
 
@@ -56,7 +93,6 @@ def prepare_for_cdn(dn_args, training, num_queries, num_classes, hidden_dim, lab
         known_lines = lines.repeat(2 * dn_number, 1)
 
         known_labels_expaned = known_labels.clone()
-        known_lines_expand = known_lines.clone()
 
         if label_noise_ratio > 0:
             p = torch.rand_like(known_labels_expaned.float())
@@ -67,60 +103,30 @@ def prepare_for_cdn(dn_args, training, num_queries, num_classes, hidden_dim, lab
         single_pad = int(max(known_num))
 
         pad_size = int(single_pad * 2 * dn_number)
-        positive_idx = torch.tensor(range(len(lines))).long().cuda().unsqueeze(0).repeat(dn_number, 1)
-        positive_idx += (torch.tensor(range(dn_number)) * len(lines) * 2).long().cuda().unsqueeze(1)
+        positive_idx = torch.arange(len(lines), device=device).unsqueeze(0).repeat(dn_number, 1)
+        positive_idx += (torch.arange(dn_number, device=device) * len(lines) * 2).unsqueeze(1)
         positive_idx = positive_idx.flatten()
         negative_idx = positive_idx + len(lines)
 
-        
-        known_lines_ = known_lines.clone()
-        known_lines_[:, :2] = (known_lines[:, :2] - known_lines[:, 2:]) / 2
-        known_lines_[:, 2:] = (known_lines[:, :2] + known_lines[:, 2:]) / 2
+        known_lines_expand = _add_line_noise(
+            known_lines, negative_idx, box_noise_scale
+        )
 
-        centers = torch.zeros_like(known_lines)
-        centers[:, :2] = (known_lines_[:, :2] + known_lines_[:, 2:]) / 2
-        centers[:, 2:] = (known_lines_[:, :2] + known_lines_[:, 2:]) / 2
-
-        # Noisy length
-        diff = torch.zeros_like(known_lines)
-        diff[:, :2] = (known_lines[:, 2:] -  known_lines[:, :2]) / 2
-        diff[:, 2:] = (known_lines[:, 2:] -  known_lines[:, :2]) / 2
-
-        rand_sign = torch.randint(low=0, high=2, size=(known_lines.shape[0], 2), dtype=torch.float32, device=known_lines.device) * 2.0 - 1.0
-        rand_part = torch.rand(size=(known_lines.shape[0], 2), device=known_lines.device)
-        rand_part[negative_idx] += 1.2 
-        rand_part *= rand_sign
-
-        known_lines_ = centers + torch.mul(rand_part.repeat_interleave(2, 1),
-                                              diff).cuda() * box_noise_scale        
-
-        known_lines_expand = known_lines_.clamp(min=0.0, max=1.0)
-
-        # order: top point > bottom point
-        #        if same y coordinate, right point > left point
-    
-        idx = torch.logical_or(known_lines_expand[..., 0] > known_lines_expand[..., 2],
-                torch.logical_or(
-                known_lines_expand[..., 0] == known_lines_expand[..., 2],
-                known_lines_expand[..., 1] < known_lines_expand[..., 3]
-                )
-            )
-
-        known_lines_expand[idx] = known_lines_expand[idx][:, [2, 3, 0, 1]]
-
-        m = known_labels_expaned.long().to('cuda')
+        m = known_labels_expaned.long().to(device)
         input_label_embed = label_enc(m)
         input_lines_embed = inverse_sigmoid(known_lines_expand)
 
-        padding_label = torch.zeros(pad_size, hidden_dim).cuda()
-        padding_lines = torch.zeros(pad_size, 4).cuda()
+        padding_label = torch.zeros(pad_size, hidden_dim, device=device)
+        padding_lines = torch.zeros(pad_size, 4, device=device)
 
         input_query_label = padding_label.repeat(batch_size, 1, 1)
         input_query_lines = padding_lines.repeat(batch_size, 1, 1)
 
-        map_known_indice = torch.tensor([]).to('cuda')
+        map_known_indice = torch.empty(0, dtype=torch.long, device=device)
         if len(known_num):
-            map_known_indice = torch.cat([torch.tensor(range(num)) for num in known_num])  # [1,2, 1,2,3]
+            map_known_indice = torch.cat([
+                torch.arange(int(num), device=device) for num in known_num
+            ])  # [1,2, 1,2,3]
             map_known_indice = torch.cat([map_known_indice + single_pad * i for i in range(2 * dn_number)]).long()
 
         if len(known_bid):
@@ -128,7 +134,7 @@ def prepare_for_cdn(dn_args, training, num_queries, num_classes, hidden_dim, lab
             input_query_lines[(known_bid.long(), map_known_indice)] = input_lines_embed
 
         tgt_size = pad_size + num_queries
-        attn_mask = torch.ones(tgt_size, tgt_size).to('cuda') < 0
+        attn_mask = torch.zeros(tgt_size, tgt_size, dtype=torch.bool, device=device)
         # match query cannot see the reconstruct
         attn_mask[pad_size:, :pad_size] = True
         # reconstruct cannot see each other
@@ -173,6 +179,3 @@ def dn_post_process(outputs_class, outputs_coord, dn_meta, aux_loss, _set_aux_lo
             out['pre_outputs'] = {'pred_logits':output_known_class[0], 'pred_lines': output_known_coord[0]}
         dn_meta['output_known_lbs_lines'] = out
     return outputs_class, outputs_coord
-
-
-
