@@ -11,6 +11,22 @@ import torch
 import util.misc as utils
 
 
+_AMP_DTYPES = {
+    'float16': torch.float16,
+    'bfloat16': torch.bfloat16,
+}
+
+
+def get_amp_dtype(args):
+    name = getattr(args, 'amp_dtype', 'float16')
+    try:
+        return _AMP_DTYPES[name]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown amp_dtype {name!r}; expected one of {sorted(_AMP_DTYPES)}."
+        ) from exc
+
+
 def _move_targets_to_device(targets, device):
     return [{k: v.to(device) for k, v in t.items() if torch.is_tensor(v)} for t in targets]
 
@@ -82,8 +98,14 @@ def _collect_line3d_depth_stats(outputs, targets):
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0, writer=None,
-                    lr_scheduler=None, warmup_scheduler=None, args=None, ema_m=None):
-    scaler = torch.amp.GradScaler(str(device), enabled=args.amp)
+                    lr_scheduler=None, warmup_scheduler=None, args=None, ema_m=None,
+                    scaler=None):
+    amp_dtype = get_amp_dtype(args)
+    if scaler is None:
+        scaler = torch.amp.GradScaler(
+            str(device),
+            enabled=args.amp and amp_dtype == torch.float16,
+        )
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -103,7 +125,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         _update_loss_weight_meters(metric_logger, criterion)
 
 
-        with torch.amp.autocast(str(device), enabled=args.amp):
+        with torch.amp.autocast(str(device), enabled=args.amp, dtype=amp_dtype):
             outputs = model(samples, targets)
         
             loss_dict = criterion(outputs, targets)

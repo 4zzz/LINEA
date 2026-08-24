@@ -28,7 +28,7 @@ from util.profiler import stats
 import util.misc as utils
 
 from datasets import build_dataset, LineEvaluator, BatchImageCollateFunction
-from engine import train_one_epoch, evaluate, test
+from engine import get_amp_dtype, train_one_epoch, evaluate, test
 
 from tensorboardX import SummaryWriter
 from warmup import LinearWarmup
@@ -72,6 +72,13 @@ def get_args_parser():
     parser.add_argument("--local_rank", type=int, help='local rank for DistributedDataParallel')
     parser.add_argument('--amp', action='store_true',
                         help="Train with mixed precision")
+    parser.add_argument(
+        '--amp-dtype',
+        dest='_cli_amp_dtype',
+        choices=('float16', 'bfloat16'),
+        default=None,
+        help='autocast dtype; overrides amp_dtype from the config',
+    )
     parser.add_argument('--print_freq', default=500, type=int, help='number of distributed processes')
     parser.add_argument(
         '--experiment-tags',
@@ -342,6 +349,11 @@ def main(args):
         else:
             raise ValueError("Key {} can used by args only".format(k))
 
+    config_amp_dtype = getattr(args, 'amp_dtype', 'float16')
+    args.amp_dtype = args._cli_amp_dtype or config_amp_dtype
+    del args._cli_amp_dtype
+    get_amp_dtype(args)
+
     config_tags = validate_tags(getattr(args, 'experiment_tags', []))
     cli_tags = validate_tags(getattr(args, '_cli_experiment_tags', []))
     args.experiment_tags = sorted(set(config_tags) | set(cli_tags))
@@ -454,6 +466,11 @@ def main(args):
         args.lr_drop_list = [args.lr_drop_list]
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.lr_drop_list, gamma=0.1)
     warmup_scheduler = LinearWarmup(lr_scheduler, args.warmup_iters) if args.use_warmup else None
+    amp_dtype = get_amp_dtype(args)
+    scaler = torch.amp.GradScaler(
+        str(device),
+        enabled=args.amp and amp_dtype == torch.float16,
+    )
 
     output_dir = Path(args.output_dir)
 
@@ -486,6 +503,11 @@ def main(args):
                     )
                 warmup_scheduler.load_state_dict(warmup_state)
                 warmup_scheduler.apply_current_step()
+            scaler_state = checkpoint.get('scaler')
+            if scaler.is_enabled() and scaler_state is not None:
+                scaler.load_state_dict(scaler_state)
+            elif scaler.is_enabled() and scaler_state is None:
+                print('Warning: checkpoint has no AMP GradScaler state; using a fresh scaler.')
             args.start_epoch = checkpoint['epoch'] + 1
 
     if args.eval:
@@ -508,7 +530,7 @@ def main(args):
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch,
             args.clip_max_norm, lr_scheduler=lr_scheduler, warmup_scheduler=warmup_scheduler, 
-            writer=writer, args=args)
+            writer=writer, args=args, scaler=scaler)
         if warmup_scheduler is None or warmup_scheduler.finished():
             lr_scheduler.step()
         else:
@@ -525,6 +547,7 @@ def main(args):
                     'optimizer': optimizer.state_dict(),
                     'lr_scheduler': lr_scheduler.state_dict(),
                     'warmup_scheduler': warmup_scheduler.state_dict() if warmup_scheduler is not None else None,
+                    'scaler': scaler.state_dict() if scaler.is_enabled() else None,
                     'epoch': epoch,
                     'args': args,
                 }
