@@ -280,7 +280,8 @@ class TransformerEncoderLayer(nn.Module):
         src, _ = self.self_attn(q, k, 
             value=src, 
             attn_mask=src_mask,
-            key_padding_mask=src_key_padding_mask)
+            key_padding_mask=src_key_padding_mask,
+            need_weights=False)
 
         src = residual + self.dropout1(src)
         if not self.normalize_before:
@@ -494,7 +495,50 @@ class HybridEncoderAsymConv(nn.Module):
             out = self.pan_blocks[idx](torch.concat([downsample_feat, feat_high], dim=1))
             outs.append(out)
         return outs
-        
+
+
+class FeatureProjectionEncoder(nn.Module):
+    """Adapt backbone feature channels without additional multiscale fusion."""
+
+    def __init__(self, in_channels, hidden_dim):
+        super().__init__()
+        self.in_channels = list(in_channels)
+        self.projections = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(in_channel, hidden_dim, kernel_size=1, bias=False),
+                nn.GroupNorm(32, hidden_dim),
+            )
+            for in_channel in self.in_channels
+        ])
+        for projection in self.projections:
+            nn.init.xavier_uniform_(projection[0].weight, gain=1)
+
+    def forward(self, feats):
+        if len(feats) != len(self.projections):
+            raise ValueError(
+                f'Expected {len(self.projections)} feature levels, got {len(feats)}.'
+            )
+        return [projection(feat) for projection, feat in zip(self.projections, feats)]
+
+
+class IdentityFeatureEncoder(nn.Module):
+    """Pass through feature levels that already match the decoder width."""
+
+    def __init__(self, in_channels, hidden_dim):
+        super().__init__()
+        self.num_levels = len(in_channels)
+        if any(channel != hidden_dim for channel in in_channels):
+            raise ValueError(
+                "feature_encoder='identity' requires every in_channels_encoder "
+                f'entry to equal hidden_dim={hidden_dim}, got {list(in_channels)}.'
+            )
+
+    def forward(self, feats):
+        if len(feats) != self.num_levels:
+            raise ValueError(f'Expected {self.num_levels} feature levels, got {len(feats)}.')
+        return feats
+
+
 def build_hybrid_encoder(args):
     return HybridEncoderAsymConv(
         in_channels=args.in_channels_encoder,
@@ -512,3 +556,17 @@ def build_hybrid_encoder(args):
         temperatureW=args.pe_temperatureW,
         eval_spatial_size= args.eval_spatial_size,
         )
+
+
+def build_feature_encoder(args):
+    mode = getattr(args, 'feature_encoder', 'hybrid')
+    if mode == 'hybrid':
+        return build_hybrid_encoder(args)
+    if mode == 'projection':
+        return FeatureProjectionEncoder(args.in_channels_encoder, args.hidden_dim)
+    if mode == 'identity':
+        return IdentityFeatureEncoder(args.in_channels_encoder, args.hidden_dim)
+    raise ValueError(
+        "feature_encoder must be 'hybrid', 'projection', or 'identity', "
+        f'got {mode!r}.'
+    )

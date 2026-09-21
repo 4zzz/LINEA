@@ -3,7 +3,10 @@
 import argparse
 import datetime
 import json
+import platform
 import random
+import subprocess
+import sys
 import time
 from pathlib import Path
 from collections import Counter
@@ -15,14 +18,24 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from util.get_param_dicts import get_optim_params
 from util.slconfig import DictAction, SLConfig
+from util.experiment_tags import (
+    resolve_experiment_text,
+    validate_tags,
+    write_experiment_tags,
+    write_experiment_text_metadata,
+)
 from util.profiler import stats
 import util.misc as utils
 
 from datasets import build_dataset, LineEvaluator, BatchImageCollateFunction
-from engine import train_one_epoch, evaluate, test
+from engine import get_amp_dtype, train_one_epoch, evaluate, test
 
 from tensorboardX import SummaryWriter
 from warmup import LinearWarmup
+
+
+CODEBASE_NAME = 'linea'
+
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
@@ -46,6 +59,9 @@ def get_args_parser():
                         help='start epoch')
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--num_workers', default=10, type=int)
+    parser.add_argument('--prefetch_factor', '--pretech_factor', dest='prefetch_factor', default=None, type=int)
+    parser.add_argument('--no_save_checkpoints', action='store_true')
+    parser.add_argument('--no_eval_during_train', action='store_true')
     parser.add_argument('--find_unused_params', action='store_true')
 
     # distributed training parameters
@@ -56,8 +72,247 @@ def get_args_parser():
     parser.add_argument("--local_rank", type=int, help='local rank for DistributedDataParallel')
     parser.add_argument('--amp', action='store_true',
                         help="Train with mixed precision")
+    parser.add_argument(
+        '--amp-dtype',
+        dest='_cli_amp_dtype',
+        choices=('float16', 'bfloat16'),
+        default=None,
+        help='autocast dtype; overrides amp_dtype from the config',
+    )
+    parser.add_argument('--print_freq', default=500, type=int, help='number of distributed processes')
+    parser.add_argument(
+        '--experiment-tags',
+        '--experiment_tags',
+        dest='_cli_experiment_tags',
+        nargs='+',
+        default=None,
+        help='custom lowercase tags to add to experiment_tags.json',
+    )
+    parser.add_argument(
+        '--experiment-name',
+        '--experiment_name',
+        dest='_cli_experiment_name',
+        default=None,
+        help='human-readable name written to experiment_name.txt',
+    )
+    parser.add_argument(
+        '--experiment-description',
+        '--experiment_description',
+        dest='_cli_experiment_description',
+        default=None,
+        help='description written to experiment_description.txt',
+    )
 
     return parser
+
+
+def _json_safe(value):
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return str(value)
+
+
+def _git_metadata():
+    metadata = {'name': CODEBASE_NAME}
+    commands = {
+        'commit': ['git', 'rev-parse', 'HEAD'],
+        'branch': ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+        'status_short': ['git', 'status', '--short'],
+        'diff_head_binary': ['git', 'diff', 'HEAD', '--binary'],
+    }
+    for key, command in commands.items():
+        try:
+            metadata[key] = subprocess.check_output(
+                command,
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        except Exception:
+            metadata[key] = None
+    metadata['untracked_files'] = []
+    metadata['untracked_diff_binary'] = None
+    try:
+        untracked_output = subprocess.check_output(
+            ['git', 'ls-files', '--others', '--exclude-standard'],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        untracked_files = [line for line in untracked_output.splitlines() if line]
+        metadata['untracked_files'] = untracked_files
+        patches = []
+        skip_prefixes = ('output/', 'logs/')
+        max_untracked_diff_bytes = 1_000_000
+        for path in untracked_files:
+            normalized_path = path.replace(os.sep, '/')
+            if normalized_path.startswith(skip_prefixes):
+                patches.append(f'# Skipped generated untracked file: {path}\n')
+                continue
+            try:
+                if os.path.getsize(path) > max_untracked_diff_bytes:
+                    patches.append(f'# Skipped large untracked file: {path}\n')
+                    continue
+            except OSError:
+                patches.append(f'# Could not stat untracked file: {path}\n')
+                continue
+            try:
+                patch = subprocess.run(
+                    ['git', 'diff', '--no-index', '--binary', '/dev/null', path],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                ).stdout
+                if patch:
+                    patches.append(patch)
+            except Exception:
+                patches.append(f'# Could not diff untracked file: {path}\n')
+        metadata['untracked_diff_binary'] = ''.join(patches)
+    except Exception:
+        pass
+    return metadata
+
+
+def _proc_meminfo():
+    meminfo_path = Path('/proc/meminfo')
+    if not meminfo_path.exists():
+        return None
+    meminfo = {}
+    try:
+        with meminfo_path.open() as f:
+            for line in f:
+                key, value = line.split(':', 1)
+                meminfo[key] = value.strip()
+    except Exception:
+        return None
+    return meminfo
+
+
+def _cuda_devices():
+    cuda = {
+        'is_available': torch.cuda.is_available(),
+        'device_count': torch.cuda.device_count(),
+        'devices': [],
+    }
+    for index in range(torch.cuda.device_count()):
+        try:
+            props = torch.cuda.get_device_properties(index)
+            cuda['devices'].append({
+                'index': index,
+                'name': props.name,
+                'total_memory_bytes': props.total_memory,
+                'major': props.major,
+                'minor': props.minor,
+                'multi_processor_count': props.multi_processor_count,
+            })
+        except Exception as exc:
+            cuda['devices'].append({
+                'index': index,
+                'error': str(exc),
+            })
+    return cuda
+
+
+def _nvidia_smi():
+    try:
+        return subprocess.check_output(
+            [
+                'nvidia-smi',
+                '--query-gpu=index,name,uuid,memory.total,driver_version',
+                '--format=csv,noheader',
+            ],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return None
+
+
+def _selected_environment():
+    prefixes = ('SLURM_',)
+    names = {
+        'CUDA_VISIBLE_DEVICES',
+        'NVIDIA_VISIBLE_DEVICES',
+        'LOCAL_RANK',
+        'RANK',
+        'WORLD_SIZE',
+        'MASTER_ADDR',
+        'MASTER_PORT',
+        'HOSTNAME',
+    }
+    return {
+        key: value
+        for key, value in sorted(os.environ.items())
+        if key in names or any(key.startswith(prefix) for prefix in prefixes)
+    }
+
+
+def _machine_metadata():
+    return {
+        'hostname': platform.node(),
+        'platform': platform.platform(),
+        'system': platform.system(),
+        'release': platform.release(),
+        'version': platform.version(),
+        'machine': platform.machine(),
+        'processor': platform.processor(),
+        'cpu_count': os.cpu_count(),
+        'meminfo': _proc_meminfo(),
+        'cuda': _cuda_devices(),
+        'nvidia_smi': _nvidia_smi(),
+        'environment': _selected_environment(),
+    }
+
+
+def save_run_metadata(args):
+    if not getattr(args, 'output_dir', None) or not utils.is_main_process():
+        return
+
+    output_dir = Path(args.output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    cmdline = {
+        'argv': sys.argv,
+        'cwd': os.getcwd(),
+    }
+    with open(output_dir / 'cmdline.json', 'w') as f:
+        json.dump(cmdline, f, indent=2)
+
+    effective_config = {
+        'args': _json_safe(vars(args)),
+        'effective_seed': args.seed + utils.get_rank() if hasattr(args, 'seed') else None,
+        'python': sys.version,
+        'torch': {
+            'version': torch.__version__,
+            'cuda': torch.version.cuda,
+            'cudnn': torch.backends.cudnn.version(),
+        },
+    }
+    with open(output_dir / 'effective_config.json', 'w') as f:
+        json.dump(effective_config, f, indent=2, sort_keys=True)
+
+    with open(output_dir / 'codebase.json', 'w') as f:
+        json.dump(_git_metadata(), f, indent=2, sort_keys=True)
+    (output_dir / 'codebase_name.txt').write_text(CODEBASE_NAME + '\n', encoding='utf-8')
+
+    with open(output_dir / 'machine.json', 'w') as f:
+        json.dump(_machine_metadata(), f, indent=2, sort_keys=True)
+
+    write_experiment_tags(output_dir, args)
+    write_experiment_text_metadata(
+        output_dir,
+        name=getattr(args, 'experiment_name', None),
+        description=getattr(args, 'experiment_description', None),
+    )
 
 
 def create(args, classname):
@@ -67,6 +322,15 @@ def create(args, classname):
     assert class_module in MODULE_BUILD_FUNCS._module_dict
     build_func = MODULE_BUILD_FUNCS.get(class_module)
     return build_func(args)
+
+
+def _dataloader_kwargs(args):
+    kwargs = {
+        'num_workers': args.num_workers,
+    }
+    if args.num_workers > 0 and args.prefetch_factor is not None:
+        kwargs['prefetch_factor'] = args.prefetch_factor
+    return kwargs
 
 def main(args):
     utils.init_distributed_mode(args)
@@ -84,6 +348,30 @@ def main(args):
             setattr(args, k, v)
         else:
             raise ValueError("Key {} can used by args only".format(k))
+
+    config_amp_dtype = getattr(args, 'amp_dtype', 'float16')
+    args.amp_dtype = args._cli_amp_dtype or config_amp_dtype
+    del args._cli_amp_dtype
+    get_amp_dtype(args)
+
+    config_tags = validate_tags(getattr(args, 'experiment_tags', []))
+    cli_tags = validate_tags(getattr(args, '_cli_experiment_tags', []))
+    args.experiment_tags = sorted(set(config_tags) | set(cli_tags))
+    del args._cli_experiment_tags
+    args.experiment_name = resolve_experiment_text(
+        getattr(args, 'experiment_name', None),
+        args._cli_experiment_name,
+        'experiment_name',
+    )
+    args.experiment_description = resolve_experiment_text(
+        getattr(args, 'experiment_description', None),
+        args._cli_experiment_description,
+        'experiment_description',
+        multiline=True,
+    )
+    del args._cli_experiment_name
+    del args._cli_experiment_description
+
     # setup tensorboar writer
     if not args.eval:
         writer = SummaryWriter(args.output_dir)
@@ -94,12 +382,15 @@ def main(args):
             args.pretrained = False
 
     # setup eval_spatial_size
-    if isinstance(args.eval_spatial_size, int):
-        size = args.eval_spatial_size 
+    if args.eval_spatial_size is not None and isinstance(args.eval_spatial_size, int):
+        size = args.eval_spatial_size
         args.eval_spatial_size = [size, size]
 
-    assert args.eval_spatial_size[0] == args.eval_spatial_size[1], 'We only support square shapes'
+    if args.eval_spatial_size is not None and hasattr(args.eval_spatial_size, "__len__") and len(args.eval_spatial_size) == 2:
+        assert args.eval_spatial_size[0] == args.eval_spatial_size[1], 'We only support square shapes'
+    save_run_metadata(args)
     device = torch.device(args.device)
+    dataloader_kwargs = _dataloader_kwargs(args)
 
     print(args)
 
@@ -130,7 +421,14 @@ def main(args):
         else:
             sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
-        data_loader_val = DataLoader(dataset_val, 64, sampler=sampler_val, drop_last=False, collate_fn=BatchImageCollateFunction(), num_workers=args.num_workers)
+        data_loader_val = DataLoader(
+            dataset_val,
+            64,
+            sampler=sampler_val,
+            drop_last=False,
+            collate_fn=BatchImageCollateFunction(),
+            **dataloader_kwargs,
+        )
     else:
         dataset_train = build_dataset(image_set='train', args=args)
         dataset_val = build_dataset(image_set='val', args=args)
@@ -141,26 +439,38 @@ def main(args):
             sampler_train = torch.utils.data.RandomSampler(dataset_train)
             sampler_val = torch.utils.data.SequentialSampler(dataset_val)
         
+        if hasattr(args.eval_spatial_size, '__len__'):
+            collate_fn_train = BatchImageCollateFunction(base_size=args.eval_spatial_size[0], base_size_repeat=3)
+            collate_fn_val = BatchImageCollateFunction(base_size=args.eval_spatial_size[0])
+        else:
+            collate_fn_train = BatchImageCollateFunction()
+            collate_fn_val = BatchImageCollateFunction()
+
         data_loader_train = DataLoader(dataset_train, 
                                         args.batch_size_train, 
                                         sampler=sampler_train, 
                                         drop_last=True,
-                                        collate_fn=BatchImageCollateFunction(base_size=args.eval_spatial_size[0], base_size_repeat=3), 
+                                        collate_fn=collate_fn_train,
                                         # pin_memory=dataset_train.pin_memory,
-                                        num_workers=args.num_workers)
+                                        **dataloader_kwargs)
         data_loader_val = DataLoader(dataset_val, 
                                         args.batch_size_val, 
                                         sampler=sampler_val, 
                                         drop_last=False,
-                                        collate_fn=BatchImageCollateFunction(base_size=args.eval_spatial_size[0]), 
+                                        collate_fn=collate_fn_val,
                                         # pin_memory=dataset_val.pin_memory,
-                                        num_workers=args.num_workers)
+                                        **dataloader_kwargs)
 
     # setup lr_drop_list
     if isinstance(args.lr_drop_list , int):
         args.lr_drop_list = [args.lr_drop_list]
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.lr_drop_list, gamma=0.1)
     warmup_scheduler = LinearWarmup(lr_scheduler, args.warmup_iters) if args.use_warmup else None
+    amp_dtype = get_amp_dtype(args)
+    scaler = torch.amp.GradScaler(
+        str(device),
+        enabled=args.amp and amp_dtype == torch.float16,
+    )
 
     output_dir = Path(args.output_dir)
 
@@ -184,6 +494,20 @@ def main(args):
                 lr_scheduler.milestones = Counter(args.lr_drop_list)
                 lr_scheduler.base_lrs = list(map(lambda group: group['initial_lr'], optimizer.param_groups))
             lr_scheduler.step(lr_scheduler.last_epoch)
+            if warmup_scheduler is not None:
+                warmup_state = checkpoint.get('warmup_scheduler')
+                if warmup_state is None:
+                    raise RuntimeError(
+                        'Cannot safely resume with use_warmup=True: checkpoint does not '
+                        'contain warmup_scheduler state.'
+                    )
+                warmup_scheduler.load_state_dict(warmup_state)
+                warmup_scheduler.apply_current_step()
+            scaler_state = checkpoint.get('scaler')
+            if scaler.is_enabled() and scaler_state is not None:
+                scaler.load_state_dict(scaler_state)
+            elif scaler.is_enabled() and scaler_state is None:
+                print('Warning: checkpoint has no AMP GradScaler state; using a fresh scaler.')
             args.start_epoch = checkpoint['epoch'] + 1
 
     if args.eval:
@@ -192,7 +516,10 @@ def main(args):
                         data_loader_val, device, args.output_dir, args=args)
         return
 
-    print(stats(model_without_ddp, args))
+    #try:
+    #    print(stats(model_without_ddp, args))
+    #except Exception as exc:
+    #    print(f"Profiler skipped: {exc}")
 
     print("-"*41 + " Start training " + "-"*42)
     start_time = time.time()
@@ -203,18 +530,15 @@ def main(args):
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch,
             args.clip_max_norm, lr_scheduler=lr_scheduler, warmup_scheduler=warmup_scheduler, 
-            writer=writer, args=args)
-        if args.output_dir:
-            checkpoint_paths = [output_dir / 'checkpoint.pth']
-
+            writer=writer, args=args, scaler=scaler)
         if warmup_scheduler is None or warmup_scheduler.finished():
             lr_scheduler.step()
         else:
             print(warmup_scheduler.last_step)
 
-        if args.output_dir:
+        if args.output_dir and not args.no_save_checkpoints:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
-            # extra checkpoint before LR drop and every 100 epochs
+            # Periodic numbered checkpoints are optional on top of the rolling latest checkpoint.
             if (epoch + 1) % args.save_checkpoint_interval == 0:
                 checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
             for checkpoint_path in checkpoint_paths:
@@ -223,15 +547,17 @@ def main(args):
                     'optimizer': optimizer.state_dict(),
                     'lr_scheduler': lr_scheduler.state_dict(),
                     'warmup_scheduler': warmup_scheduler.state_dict() if warmup_scheduler is not None else None,
+                    'scaler': scaler.state_dict() if scaler.is_enabled() else None,
                     'epoch': epoch,
                     'args': args,
                 }
                 utils.save_on_master(weights, checkpoint_path)
                 
-        # eval
-        test_stats = evaluate(
-            model, criterion, postprocessors, data_loader_val, device, args.output_dir, args=args
-        )
+        test_stats = {}
+        if not args.no_eval_during_train:
+            test_stats = evaluate(
+                model, criterion, postprocessors, data_loader_val, device, args.output_dir, args=args
+            )
 
         if utils.is_main_process():
             for k in test_stats:

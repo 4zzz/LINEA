@@ -14,6 +14,8 @@ import os, sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 from util.misc import get_world_size, is_dist_avail_and_initialized
 
+from .moge.utils.alignment import align_points_scale_xyz_shift, align_points_scale_z_shift
+from .line3d_alignment import fit_matched_lines3d_alignment
 
 class LINEACriterion(nn.Module):
     """ This class computes the loss for Conditional DETR.
@@ -21,7 +23,18 @@ class LINEACriterion(nn.Module):
         1) we compute hungarian assignment between ground truth boxes and the outputs of the model
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
-    def __init__(self, num_classes, matcher, weight_dict, focal_alpha, losses):
+    def __init__(
+        self,
+        num_classes,
+        matcher,
+        weight_dict,
+        focal_alpha,
+        losses,
+        line3d_alignment='xyz_shift',
+        line3d_loss_type='l1',
+        line3d_smooth_l1_beta=1.0,
+        line3d_z_loss_type='l1',
+    ):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -36,6 +49,25 @@ class LINEACriterion(nn.Module):
         self.weight_dict = weight_dict
         self.losses = losses
         self.focal_alpha = focal_alpha
+        self.line3d_alignment = line3d_alignment
+        self.line3d_loss_type = line3d_loss_type
+        self.line3d_smooth_l1_beta = line3d_smooth_l1_beta
+        self.line3d_z_loss_type = line3d_z_loss_type
+        self.unscaled_loss_dict = {}
+
+    def _reset_unscaled_losses(self):
+        self.unscaled_loss_dict = {}
+
+    def _weight_losses(self, losses, suffix=''):
+        """Record raw losses for logging, then apply their configured weights."""
+        weighted_losses = {}
+        for name, value in losses.items():
+            if name not in self.weight_dict:
+                continue
+            output_name = f'{name}{suffix}'
+            self.unscaled_loss_dict[output_name] = value.detach()
+            weighted_losses[output_name] = value * self.weight_dict[name]
+        return weighted_losses
 
     def loss_labels(self, outputs, targets, indices, num_boxes):
         """Classification loss (Binary focal loss)
@@ -76,6 +108,111 @@ class LINEACriterion(nn.Module):
 
         return losses
 
+    def loss_lines3d(self, outputs, targets, indices, num_boxes):
+        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
+           targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
+           The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
+        """
+        assert 'pred_lines3d' in outputs
+
+        losses_per_image = []
+
+        for batch_i, ((src_idx, tgt_idx), target) in enumerate(zip(indices, targets)):
+            if len(src_idx) == 0:
+                continue
+
+            src_lines3d = outputs['pred_lines3d'][batch_i, src_idx]   # [M, 6]
+            tgt_lines3d = target['lines3d'][tgt_idx]
+
+            # [M, 2, 3]
+            src_pts = src_lines3d.view(-1, 2, 3)
+            tgt_pts = tgt_lines3d.view(-1, 2, 3)
+
+            losses_per_image.append(self._aligned_lines3d_loss(src_pts, tgt_pts).sum())
+
+        if len(losses_per_image) == 0:
+            return {'loss_line3d': outputs['pred_lines3d'].sum() * 0.0}
+
+        loss_line3d = torch.stack(losses_per_image).sum() / num_boxes
+        return {'loss_line3d': loss_line3d}
+
+    def loss_lines3d_z(self, outputs, targets, indices, num_boxes):
+        assert 'pred_lines3d' in outputs
+
+        losses_per_image = []
+
+        for batch_i, ((src_idx, tgt_idx), target) in enumerate(zip(indices, targets)):
+            if len(src_idx) == 0:
+                continue
+
+            src_lines3d = outputs['pred_lines3d'][batch_i, src_idx].view(-1, 2, 3)
+            tgt_lines3d = target['lines3d'][tgt_idx].view(-1, 2, 3)
+
+            src_z = src_lines3d[..., 2]
+            tgt_z = tgt_lines3d[..., 2]
+            tgt_z_swapped = tgt_z[:, [1, 0]]
+
+            loss_direct = self._line3d_z_regression_loss(src_z, tgt_z).sum(dim=-1)
+            loss_swapped = self._line3d_z_regression_loss(src_z, tgt_z_swapped).sum(dim=-1)
+            losses_per_image.append(torch.minimum(loss_direct, loss_swapped).sum())
+
+        if len(losses_per_image) == 0:
+            return {'loss_line3d_z': outputs['pred_lines3d'].sum() * 0.0}
+
+        loss_line3d_z = torch.stack(losses_per_image).sum() / num_boxes
+        return {'loss_line3d_z': loss_line3d_z}
+
+    def _aligned_lines3d_loss(self, src_pts, tgt_pts):
+        # src_pts, tgt_pts: [M, 2, 3]
+        tgt_pts_swapped = tgt_pts[:, [1, 0], :]
+        scale, shift, _ = fit_matched_lines3d_alignment(
+            src_pts,
+            tgt_pts,
+            self._fit_line3d_alignment,
+            self._line3d_regression_loss,
+        )
+        src_pts_flat = src_pts.reshape(1, -1, 3)   # [1, 2M, 3]
+        src_aligned = scale[:, None, None] * src_pts_flat + shift[:, None, :]
+        src_aligned = src_aligned.reshape(-1, 2, 3)
+        loss_direct = self._line3d_regression_loss(src_aligned, tgt_pts)
+        loss_swapped = self._line3d_regression_loss(src_aligned, tgt_pts_swapped)
+
+        return torch.minimum(
+            loss_direct.sum(dim=(1, 2)),
+            loss_swapped.sum(dim=(1, 2)),
+        )
+
+    def _fit_line3d_alignment(self, src_pts, tgt_pts, weight):
+        if self.line3d_alignment == 'xyz_shift':
+            return align_points_scale_xyz_shift(src_pts, tgt_pts, weight)
+        if self.line3d_alignment == 'z_shift':
+            return align_points_scale_z_shift(src_pts, tgt_pts, weight)
+        raise ValueError(f"Unknown line3d_alignment value '{self.line3d_alignment}'.")
+
+    def _line3d_regression_loss(self, src_aligned, tgt_pts_flat):
+        if self.line3d_loss_type == 'l1':
+            return F.l1_loss(src_aligned, tgt_pts_flat, reduction='none')
+        if self.line3d_loss_type == 'smooth_l1':
+            return F.smooth_l1_loss(
+                src_aligned,
+                tgt_pts_flat,
+                reduction='none',
+                beta=self.line3d_smooth_l1_beta,
+            )
+        raise ValueError(f"Unknown line3d_loss_type '{self.line3d_loss_type}'.")
+
+    def _line3d_z_regression_loss(self, src_z, tgt_z):
+        if self.line3d_z_loss_type == 'l1':
+            return F.l1_loss(src_z, tgt_z, reduction='none')
+        if self.line3d_z_loss_type == 'smooth_l1':
+            return F.smooth_l1_loss(
+                src_z,
+                tgt_z,
+                reduction='none',
+                beta=self.line3d_smooth_l1_beta,
+            )
+        raise ValueError(f"Unknown line3d_z_loss_type '{self.line3d_z_loss_type}'.")
+
     def loss_lmap(self, outputs, targets, indices, num_boxes):
         losses = {}
         if 'aux_lmap' in outputs:
@@ -114,6 +251,8 @@ class LINEACriterion(nn.Module):
         loss_map = {
             'labels': self.loss_labels,
             'lines': self.loss_lines,
+            'lines3d': self.loss_lines3d,
+            'lines3d_z': self.loss_lines3d_z,
             'lmap': self.loss_lmap,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
@@ -134,6 +273,7 @@ class LINEACriterion(nn.Module):
         indices = self.matcher(outputs_without_aux, targets)
         if return_indices:
             return indices
+        self._reset_unscaled_losses()
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_boxes = sum(len(t["labels"]) for t in targets)
@@ -149,7 +289,7 @@ class LINEACriterion(nn.Module):
             indices_in = indices
             num_boxes_in = num_boxes
             l_dict = self.get_loss(loss, outputs, targets, indices_in, num_boxes_in)
-            l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
+            l_dict = self._weight_losses(l_dict)
             losses.update(l_dict)
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
@@ -158,8 +298,7 @@ class LINEACriterion(nn.Module):
                 indices = self.matcher(aux_outputs, targets)
                 for loss in self.losses:      
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes)
-                    l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
-                    l_dict = {k + f'_{idx}': v for k, v in l_dict.items()}
+                    l_dict = self._weight_losses(l_dict, suffix=f'_{idx}')
                     losses.update(l_dict)
 
         # interm_outputs loss
@@ -168,8 +307,7 @@ class LINEACriterion(nn.Module):
             indices = self.matcher(interm_outputs, targets)
             for loss in self.losses:
                 l_dict = self.get_loss(loss, interm_outputs, targets, indices, num_boxes)
-                l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
-                l_dict = {k + f'_interm': v for k, v in l_dict.items()}
+                l_dict = self._weight_losses(l_dict, suffix='_interm')
                 losses.update(l_dict)
 
         # pre output loss
@@ -178,8 +316,7 @@ class LINEACriterion(nn.Module):
             indices = self.matcher(pre_outputs, targets)
             for loss in self.losses:
                 l_dict = self.get_loss(loss, pre_outputs, targets, indices, num_boxes)
-                l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
-                l_dict = {k + f'_pre': v for k, v in l_dict.items()}
+                l_dict = self._weight_losses(l_dict, suffix='_pre')
                 losses.update(l_dict)
 
         # prepare for dn loss
@@ -209,8 +346,7 @@ class LINEACriterion(nn.Module):
                 for idx, aux_outputs in enumerate(dn_outputs['aux_outputs']):
                     for loss in self.losses:
                         l_dict = self.get_loss(loss, aux_outputs, targets, dn_pos_idx, num_boxes*scalar)
-                        l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
-                        l_dict = {k + f'_dn_{idx}': v for k, v in l_dict.items()}
+                        l_dict = self._weight_losses(l_dict, suffix=f'_dn_{idx}')
                         losses.update(l_dict)
 
             if 'aux_pre_outputs' in dn_outputs:
@@ -218,8 +354,7 @@ class LINEACriterion(nn.Module):
                 l_dict={}
                 for loss in self.losses:
                     l_dict.update(self.get_loss(loss, aux_outputs_known, targets, dn_pos_idx, num_boxes*scalar))
-                l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}  
-                l_dict = {k + f'_pre_dn': v for k, v in l_dict.items()}
+                l_dict = self._weight_losses(l_dict, suffix='_pre_dn')
                 losses.update(l_dict)
 
         losses = {k: v for k, v in sorted(losses.items(), key=lambda item: item[0])}
@@ -359,6 +494,7 @@ class DFINESetCriterion(LINEACriterion):
         indices = self.matcher(outputs_without_aux, targets)
 
         self._clear_cache()
+        self._reset_unscaled_losses()
 
         # Get the matching union set across all decoder layers.
         if 'aux_outputs' in outputs:
@@ -402,7 +538,7 @@ class DFINESetCriterion(LINEACriterion):
             indices_in = indices_go if loss in ['lines', 'local'] else indices
             num_boxes_in = num_boxes_go if loss in ['lines', 'local'] else num_boxes
             l_dict = self.get_loss(loss, outputs, targets, indices_in, num_boxes_in)
-            l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
+            l_dict = self._weight_losses(l_dict)
             losses.update(l_dict)
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
@@ -414,8 +550,7 @@ class DFINESetCriterion(LINEACriterion):
                     indices_in = indices_go if loss in ['lines', 'local'] else cached_indices[idx]
                     num_boxes_in = num_boxes_go if loss in ['lines', 'local'] else num_boxes
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices_in, num_boxes_in)
-                    l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
-                    l_dict = {k + f'_{idx}': v for k, v in l_dict.items()}
+                    l_dict = self._weight_losses(l_dict, suffix=f'_{idx}')
                     losses.update(l_dict)
 
         # interm_outputs loss
@@ -426,8 +561,7 @@ class DFINESetCriterion(LINEACriterion):
                 indices_in = indices_go if loss in ['lines', 'local'] else cached_indices_enc[0]
                 num_boxes_in = num_boxes_go if loss in ['lines', 'local'] else num_boxes
                 l_dict = self.get_loss(loss, interm_outputs, targets, indices_in, num_boxes_in)
-                l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
-                l_dict = {k + f'_interm': v for k, v in l_dict.items()}
+                l_dict = self._weight_losses(l_dict, suffix='_interm')
                 losses.update(l_dict)
 
         # pre output loss
@@ -438,8 +572,7 @@ class DFINESetCriterion(LINEACriterion):
                 indices_in = indices_go if loss in ['lines', 'local'] else cached_indices[-1]
                 num_boxes_in = num_boxes_go if loss in ['lines', 'local'] else num_boxes
                 l_dict = self.get_loss(loss, pre_outputs, targets, indices_in, num_boxes_in)
-                l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
-                l_dict = {k + f'_pre': v for k, v in l_dict.items()}
+                l_dict = self._weight_losses(l_dict, suffix='_pre')
                 losses.update(l_dict)
 
 
@@ -474,8 +607,7 @@ class DFINESetCriterion(LINEACriterion):
                     # indices = self.matcher(aux_outputs, targets)
                     for loss in self.losses:
                         l_dict = self.get_loss(loss, aux_outputs, targets, dn_pos_idx, num_boxes*scalar)
-                        l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
-                        l_dict = {k + f'_dn_{idx}': v for k, v in l_dict.items()}
+                        l_dict = self._weight_losses(l_dict, suffix=f'_dn_{idx}')
                         losses.update(l_dict)
 
             if 'aux_pre_outputs' in dn_outputs:
@@ -483,14 +615,12 @@ class DFINESetCriterion(LINEACriterion):
                 l_dict={}
                 for loss in self.losses:
                     l_dict.update(self.get_loss(loss, aux_outputs_known, targets, dn_pos_idx, num_boxes*scalar))
-                l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}  
-                l_dict = {k + f'_pre_dn': v for k, v in l_dict.items()}
+                l_dict = self._weight_losses(l_dict, suffix='_pre_dn')
                 losses.update(l_dict)
 
         if 'aux_lmap' in outputs:
             l_dict = self.get_loss('lmap', outputs, targets, indices, num_boxes, **kwargs)
-            l_dict = {k: v for k, v in l_dict.items()}
-            l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}  
+            l_dict = self._weight_losses(l_dict)
             losses.update(l_dict)
 
         losses = {k: v for k, v in sorted(losses.items(), key=lambda item: item[0])}
@@ -504,8 +634,17 @@ def build_criterion(args):
     matcher = build_matcher(args)
 
     if args.criterion_type == 'default':
-        criterion = LINEACriterion(num_classes, matcher=matcher, weight_dict=args.weight_dict,
-                             focal_alpha=args.focal_alpha, losses=args.losses)
+        criterion = LINEACriterion(
+            num_classes, 
+            matcher=matcher, 
+            weight_dict=args.weight_dict,
+            focal_alpha=args.focal_alpha, 
+            losses=args.losses, 
+            line3d_alignment=getattr(args, 'line3d_alignment', 'xyz_shift'),
+            line3d_loss_type=getattr(args, 'line3d_loss_type', 'l1'),
+            line3d_smooth_l1_beta=getattr(args, 'line3d_smooth_l1_beta', 1.0),
+            line3d_z_loss_type=getattr(args, 'line3d_z_loss_type', 'l1'),
+        )
     elif args.criterion_type == 'dfine':
         criterion = DFINESetCriterion(num_classes, matcher=matcher, weight_dict=args.weight_dict,
                              focal_alpha=args.focal_alpha, reg_max=args.reg_max, losses=args.losses)

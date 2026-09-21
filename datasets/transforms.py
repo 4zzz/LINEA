@@ -12,6 +12,53 @@ import numbers
 
 import numpy as np
 
+
+def _endpoint_swap_mask(lines):
+    return torch.logical_or(
+        lines[..., 0] > lines[..., 2],
+        torch.logical_and(
+            lines[..., 0] == lines[..., 2],
+            lines[..., 1] > lines[..., 3],
+        ),
+    )
+
+
+def _swap_line_endpoints(lines, lines3d, swap_mask):
+    lines = lines.clone()
+    lines[swap_mask] = lines[swap_mask][:, [2, 3, 0, 1]]
+    if lines3d is None:
+        return lines, None
+
+    lines3d = lines3d.view(-1, 2, 3).clone()
+    lines3d[swap_mask] = lines3d[swap_mask][:, [1, 0], :]
+    return lines, lines3d.reshape(-1, 6)
+
+
+def _clip_lines3d_to_projected_lines(lines3d, source_lines2d, clipped_lines2d):
+    points = lines3d.view(-1, 2, 3)
+    source_uv = source_lines2d.view(-1, 2, 2)
+    clipped_uv = clipped_lines2d.view(-1, 2, 2)
+
+    uv_delta = source_uv[:, 1] - source_uv[:, 0]
+    uv_norm_sq = uv_delta.square().sum(dim=-1).clamp_min(1e-12)
+    screen_t = (
+        (clipped_uv - source_uv[:, :1]) * uv_delta[:, None]
+    ).sum(dim=-1) / uv_norm_sq[:, None]
+    screen_t = screen_t.clamp(0.0, 1.0)
+
+    z0 = points[:, 0, 2:3]
+    z1 = points[:, 1, 2:3]
+    denominator = (1.0 - screen_t) * z1 + screen_t * z0
+    denominator = torch.where(
+        denominator.abs() < 1e-12,
+        torch.full_like(denominator, 1e-12),
+        denominator,
+    )
+    line_t = screen_t * z0 / denominator
+    clipped_points = points[:, :1] + line_t[..., None] * (points[:, 1:] - points[:, :1])
+    return clipped_points.reshape(-1, 6)
+
+
 def crop(image, target, region):
     cropped_image = F.crop(image, *region)
 
@@ -20,6 +67,12 @@ def crop(image, target, region):
 
     # should we do something wrt the original size?
     target["size"] = torch.tensor([h, w])
+
+    if "camera_K" in target:
+        camera_k = target["camera_K"].clone()
+        camera_k[0, 2] -= j
+        camera_k[1, 2] -= i
+        target["camera_K"] = camera_k
 
     fields = ["labels", "area", "iscrowd"]
 
@@ -50,6 +103,9 @@ def crop(image, target, region):
 
         keep = torch.logical_and(keep_x, keep_y)
         cropped_lines = cropped_lines[keep]
+        cropped_lines3d = target.get("lines3d")
+        if cropped_lines3d is not None:
+            cropped_lines3d = cropped_lines3d[keep]
         clamped_lines = torch.zeros_like(cropped_lines)
 
         for i,line in enumerate(cropped_lines):
@@ -74,6 +130,12 @@ def crop(image, target, region):
         keep_real_lines = (clamped_lines[:, :2] - clamped_lines[:, 2:]).norm(dim=1) > 10
         
         target["lines"] = clamped_lines[keep_real_lines]
+        if cropped_lines3d is not None:
+            target["lines3d"] = _clip_lines3d_to_projected_lines(
+                cropped_lines3d,
+                cropped_lines,
+                clamped_lines,
+            )[keep_real_lines]
 
     for field in fields:
         target[field] = target[field][keep][keep_real_lines]
@@ -89,8 +151,15 @@ def hflip(image, target):
     target = target.copy()
     if "lines" in target:
         lines = target["lines"]   
-        lines = lines[:, [2, 3, 0, 1]] * torch.as_tensor([-1, 1, -1, 1]) + torch.as_tensor([w, 0, w, 0])
+        lines = lines[:, [2, 3, 0, 1]] * torch.as_tensor([-1, 1, -1, 1]) + torch.as_tensor([w - 1, 0, w - 1, 0])
         target["lines"] = lines
+        if "lines3d" in target:
+            target["lines3d"] = target["lines3d"].view(-1, 2, 3)[:, [1, 0], :].reshape(-1, 6)
+    if "camera_K" in target:
+        camera_k = target["camera_K"].clone()
+        camera_k[0, 0] = -camera_k[0, 0]
+        camera_k[0, 2] = w - 1 - camera_k[0, 2]
+        target["camera_K"] = camera_k
 
     if 'lmap' in target:
         flipped_lmaps = []
@@ -112,10 +181,19 @@ def vflip(image, target):
         lines = target["lines"]
 
         # in dataset, we assume if two points with same x coord, we assume first point is the upper point
-        lines = lines * torch.as_tensor([1, -1, 1, -1]) + torch.as_tensor([0, h, 0, h])
+        lines = lines * torch.as_tensor([1, -1, 1, -1]) + torch.as_tensor([0, h - 1, 0, h - 1])
         vertical_line_idx = (lines[:, 0] == lines[:, 2])
         lines[vertical_line_idx] = torch.index_select(lines[vertical_line_idx], 1, torch.tensor([2,3,0,1]))
         target["lines"] = lines
+        if "lines3d" in target:
+            lines3d = target["lines3d"].view(-1, 2, 3)
+            lines3d[vertical_line_idx] = lines3d[vertical_line_idx][:, [1, 0], :]
+            target["lines3d"] = lines3d.reshape(-1, 6)
+    if "camera_K" in target:
+        camera_k = target["camera_K"].clone()
+        camera_k[1, 1] = -camera_k[1, 1]
+        camera_k[1, 2] = h - 1 - camera_k[1, 2]
+        target["camera_K"] = camera_k
 
     if 'lmap' in target:
         flipped_lmaps = []
@@ -169,6 +247,13 @@ def resize(image, target, size, max_size=None):
         lines = target["lines"]
         scaled_lines = lines * torch.as_tensor([ratio_width, ratio_height, ratio_width, ratio_height])
         target["lines"] = scaled_lines
+    if "camera_K" in target:
+        camera_k = target["camera_K"].clone()
+        camera_k[0, 0] *= ratio_width
+        camera_k[0, 2] *= ratio_width
+        camera_k[1, 1] *= ratio_height
+        camera_k[1, 2] *= ratio_height
+        target["camera_K"] = camera_k
 
     if 'lmap' in target:
         resize_lmaps = []
@@ -218,13 +303,27 @@ def rotation(image, target, rotation_type):
             lines = target["lines"]
             rotated_lines = lines[..., [1, 0, 3, 2]]
             rotated_lines[..., [1, 3]] = w - 1 - rotated_lines[..., [1, 3]]
+        image_transform = torch.tensor(
+            [[0.0, 1.0, 0.0], [-1.0, 0.0, w - 1.0], [0.0, 0.0, 1.0]]
+        )
     elif rotation_type == 2:
         if "lines" in target:
             lines = target["lines"]
             rotated_lines = lines[..., [1, 0, 3, 2]]
             rotated_lines[..., [0, 2]] = h - 1 - rotated_lines[..., [0, 2]]
+        image_transform = torch.tensor(
+            [[0.0, -1.0, h - 1.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+        )
 
-    target['lines'] = rotated_lines
+    lines3d = target.get('lines3d')
+    swap_mask = _endpoint_swap_mask(rotated_lines)
+    target['lines'], swapped_lines3d = _swap_line_endpoints(rotated_lines, lines3d, swap_mask)
+    if swapped_lines3d is not None:
+        target['lines3d'] = swapped_lines3d
+
+    if 'camera_K' in target:
+        image_transform = image_transform.to(target['camera_K'])
+        target['camera_K'] = image_transform @ target['camera_K']
 
     if 'lmap' in target:
         rotated_lmap = F.rotate(target['lmap'], rotation[rotation_type])
@@ -408,9 +507,10 @@ class ColorJitter(object):
 
 
 class Normalize(object):
-    def __init__(self, mean, std):
+    def __init__(self, mean, std, normalize_lines=True):
         self.mean = mean
         self.std = std
+        self.normalize_lines = normalize_lines
 
     def __call__(self, image, target=None):
         image = F.normalize(image, mean=self.mean, std=self.std)
@@ -421,15 +521,13 @@ class Normalize(object):
 
         if "lines" in target:
             lines = target["lines"]
-            lines = lines / torch.tensor([w, h, w, h], dtype=torch.float32)
-            idx = torch.logical_or(lines[..., 0] > lines[..., 2],
-                torch.logical_or(
-                lines[..., 0] == lines[..., 2],
-                lines[..., 1] < lines[..., 3]
-                )
-            )
-            lines[idx] = lines[idx][:, [2, 3, 0, 1]]
+            if self.normalize_lines:
+                lines = lines / torch.tensor([w, h, w, h], dtype=torch.float32)
+            swap_mask = _endpoint_swap_mask(lines)
+            lines, lines3d = _swap_line_endpoints(lines, target.get("lines3d"), swap_mask)
             target["lines"] = lines
+            if lines3d is not None:
+                target["lines3d"] = lines3d
 
         return image, target
 

@@ -49,11 +49,22 @@ class BatchImageCollateFunction(BaseCollateFunction):
         # self.interpolation = interpolation
 
     def __call__(self, items):
-        images = torch.cat([x[0][None] for x in items], dim=0)
+        images = [x[0] for x in items]
         targets = [x[1] for x in items]
 
         if self.scales is not None: # and self.epoch < self.stop_epoch:
             sz = random.choice(self.scales)
-            images = resize(images, [sz, sz])
+            images = resize(torch.cat([img[None] for img in images], dim=0), [sz, sz])
+        else:
+            max_h = max(img.shape[-2] for img in images)
+            max_w = max(img.shape[-1] for img in images)
+            target_h = max(max_h, 640)
+            target_w = max(max_w, 640)
+            target_h += (32 - target_h % 32) % 32
+            target_w += (32 - target_w % 32) % 32
+            images = torch.stack([
+                F.pad(img, (0, target_w - img.shape[-1], 0, target_h - img.shape[-2]))
+                for img in images
+            ], dim=0)
 
         return images, targets

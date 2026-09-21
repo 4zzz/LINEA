@@ -20,6 +20,14 @@ class Warmup(object):
     def load_state_dict(self, state_dict):
         self.__dict__.update(state_dict)
 
+    def apply_current_step(self):
+        """Reapply the LR represented by restored warmup state."""
+        if self.finished():
+            return
+        factor = self.get_warmup_factor(self.last_step)
+        for i, pg in enumerate(self.lr_scheduler.optimizer.param_groups):
+            pg['lr'] = factor * self.warmup_end_values[i]
+
     def get_warmup_factor(self, step, **kwargs):
         raise NotImplementedError
 
