@@ -13,6 +13,12 @@ from typing import Any, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tools.inference_cli import add_argument
+
+
 DEFAULT_PYTHON = (
     str(REPO_ROOT / 'venv314' / 'bin' / 'python')
     if (REPO_ROOT / 'venv314' / 'bin' / 'python').is_file()
@@ -55,7 +61,10 @@ def build_command(
     batch_size: int | None,
     num_workers: int | None,
     max_samples: int | None,
-    single_file: str | None,
+    prediction_files: bool,
+    single_prediction_file: str | None,
+    glb_models: bool,
+    model_add_ground_truth: bool,
     save_png_visualization: bool,
     passthrough: Sequence[str],
     python: str,
@@ -84,8 +93,14 @@ def build_command(
         command.extend(['--num_workers', str(num_workers)])
     if max_samples is not None:
         command.extend(['--max_samples', str(max_samples)])
-    if single_file is not None:
-        command.extend(['--single_file', single_file])
+    if prediction_files:
+        command.append('--prediction-files')
+    if single_prediction_file is not None:
+        command.extend(['--single-prediction-file', single_prediction_file])
+    if glb_models:
+        command.append('--glb-models')
+    if model_add_ground_truth:
+        command.append('--model-add-ground-truth')
     if save_png_visualization:
         command.append('--save_png_visualization')
     command.extend(passthrough)
@@ -96,35 +111,58 @@ def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description='Infer a checkpoint using its recorded effective configuration.',
     )
-    parser.add_argument('--checkpoint', required=True, type=Path)
-    parser.add_argument('--split', choices=('train', 'val', 'test'), default='test')
-    parser.add_argument('-o', '--output-directory', type=Path, default=None)
-    parser.add_argument('--effective-config', type=Path, default=None)
-    parser.add_argument('--pred-threshold', '--pred_threshold', type=float, default=0.0)
-    parser.add_argument('--device', default=None)
-    parser.add_argument('--batch-size', '--batch_size', type=int, default=None)
-    parser.add_argument('--num-workers', '--num_workers', type=int, default=None)
-    parser.add_argument('--max-samples', '--max_samples', type=int, default=None)
-    parser.add_argument('--single-file', '--single_file', default=None)
-    parser.add_argument('--save-png-visualization', action='store_true')
-    parser.add_argument(
+    add_argument(parser, '--checkpoint', required=True, type=Path)
+    add_argument(parser, '--split', choices=('train', 'val', 'test'), default='test')
+    add_argument(parser, '-o', '--output-directory', type=Path, default=None)
+    add_argument(parser, '--effective-config', type=Path, default=None)
+    add_argument(parser, '--pred-threshold', type=float, default=0.0)
+    add_argument(parser, '--device', default=None)
+    add_argument(parser, '--batch-size', type=int, default=None)
+    add_argument(parser, '--num-workers', type=int, default=None)
+    add_argument(parser, '--max-samples', type=int, default=None)
+    prediction_group = parser.add_mutually_exclusive_group()
+    add_argument(prediction_group, '--prediction-files', action='store_true')
+    add_argument(
+        prediction_group,
+        '-p',
+        '--single-prediction-file',
+        '--single-file',
+        default=None,
+    )
+    add_argument(parser, '--glb-models', action='store_true')
+    add_argument(parser, '--model-add-ground-truth', action='store_true')
+    add_argument(parser, '--save-png-visualization', action='store_true')
+    add_argument(
+        parser,
         '--fit-affine',
         action=argparse.BooleanOptionalAction,
         default=None,
         help='Override automatic affine fitting based on args.linea3d.',
     )
     sample_group = parser.add_mutually_exclusive_group()
-    sample_group.add_argument('-d', '--dont-save-sample', action='store_true', dest='dont_save_sample')
-    sample_group.add_argument('--save-sample', action='store_false', dest='dont_save_sample')
+    add_argument(sample_group, '-d', '--dont-save-sample', action='store_true', dest='dont_save_sample')
+    add_argument(sample_group, '--save-sample', action='store_false', dest='dont_save_sample')
     parser.set_defaults(dont_save_sample=True)
-    parser.add_argument('--python', default=DEFAULT_PYTHON)
-    parser.add_argument('--dry-run', action='store_true')
+    add_argument(parser, '--python', default=DEFAULT_PYTHON)
+    add_argument(parser, '--dry-run', action='store_true')
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = make_parser()
     args, passthrough = parser.parse_known_args(argv)
+    if not (
+        args.prediction_files
+        or args.single_prediction_file
+        or args.glb_models
+        or args.save_png_visualization
+    ):
+        parser.error(
+            'Select at least one output: --prediction-files, --single-prediction-file, '
+            '--glb-models, or --save-png-visualization.'
+        )
+    if args.model_add_ground_truth and not args.glb_models:
+        parser.error('--model-add-ground-truth requires --glb-models.')
 
     checkpoint = args.checkpoint.expanduser()
     if not checkpoint.is_absolute():
@@ -156,7 +194,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         max_samples=args.max_samples,
-        single_file=args.single_file,
+        prediction_files=args.prediction_files,
+        single_prediction_file=args.single_prediction_file,
+        glb_models=args.glb_models,
+        model_add_ground_truth=args.model_add_ground_truth,
         save_png_visualization=args.save_png_visualization,
         passthrough=passthrough,
         python=args.python,

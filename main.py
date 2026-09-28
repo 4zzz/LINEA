@@ -25,6 +25,7 @@ from util.experiment_tags import (
     write_experiment_text_metadata,
 )
 from util.profiler import stats
+from util.git_utils import git_output, git_repository_root
 import util.misc as utils
 
 from datasets import build_dataset, LineEvaluator, BatchImageCollateFunction
@@ -123,6 +124,7 @@ def _json_safe(value):
 
 
 def _git_metadata():
+    repository_root = git_repository_root(Path(__file__).resolve().parent)
     metadata = {'name': CODEBASE_NAME}
     commands = {
         'commit': ['git', 'rev-parse', 'HEAD'],
@@ -131,19 +133,15 @@ def _git_metadata():
         'diff_head_binary': ['git', 'diff', 'HEAD', '--binary'],
     }
     for key, command in commands.items():
-        try:
-            metadata[key] = subprocess.check_output(
-                command,
-                text=True,
-                stderr=subprocess.DEVNULL,
-            ).strip()
-        except Exception:
-            metadata[key] = None
+        metadata[key] = git_output(command, repository_root)
     metadata['untracked_files'] = []
     metadata['untracked_diff_binary'] = None
+    if repository_root is None:
+        return metadata
     try:
         untracked_output = subprocess.check_output(
             ['git', 'ls-files', '--others', '--exclude-standard'],
+            cwd=repository_root,
             text=True,
             stderr=subprocess.DEVNULL,
         )
@@ -158,7 +156,7 @@ def _git_metadata():
                 patches.append(f'# Skipped generated untracked file: {path}\n')
                 continue
             try:
-                if os.path.getsize(path) > max_untracked_diff_bytes:
+                if os.path.getsize(repository_root / path) > max_untracked_diff_bytes:
                     patches.append(f'# Skipped large untracked file: {path}\n')
                     continue
             except OSError:
@@ -167,6 +165,7 @@ def _git_metadata():
             try:
                 patch = subprocess.run(
                     ['git', 'diff', '--no-index', '--binary', '/dev/null', path],
+                    cwd=repository_root,
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,

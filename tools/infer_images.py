@@ -7,7 +7,7 @@ import argparse
 import json
 import math
 import os
-import subprocess
+import re
 import sys
 from pathlib import Path
 from typing import Any, Sequence
@@ -24,6 +24,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from datasets import BatchImageCollateFunction
+from tools.inference_cli import add_argument
+from util.git_utils import git_output, git_repository_root
+from util.line_model_export import save_line_model_glb
 from util.prediction_record import PredictionRecord, make_prediction_file, save, utc_timestamp
 
 
@@ -225,6 +228,15 @@ def default_output_path(checkpoint: Path) -> Path:
     return checkpoint.parent / "inference" / f"{checkpoint.name}_images" / DEFAULT_OUTPUT_NAME
 
 
+def default_output_directory(checkpoint: Path) -> Path:
+    return checkpoint.parent / "inference" / f"{checkpoint.name}_images"
+
+
+def image_output_directory(root: Path, index: int, image_path: Path) -> Path:
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", image_path.stem).strip("._-")
+    return root / f"{index + 1:03d}-{safe_stem or 'image'}"
+
+
 def _make_transform(model_args):
     dataset_name = getattr(model_args, "dataset_name", "coco")
     if dataset_name == "monolines3d":
@@ -335,34 +347,54 @@ def _draw_prediction(image_path, lines, scores, threshold):
     return image
 
 
+git_root = git_repository_root(REPO_ROOT)
+
+
 def _git_output(*command):
-    try:
-        return subprocess.check_output(command, cwd=REPO_ROOT, text=True, stderr=subprocess.DEVNULL).strip()
-    except Exception:
-        return None
+    return git_output(command, git_root)
 
 
 def make_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("images", nargs="*", type=Path, help="image paths")
-    parser.add_argument("--checkpoint", required=True, type=Path)
-    parser.add_argument("--image", nargs="+", action="append", type=Path, default=[])
-    parser.add_argument("--image-list", action="append", type=Path, default=[])
-    parser.add_argument("-o", "--output", type=Path, default=None, help="combined JSON or JSON.GZ output file")
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--pred-threshold", type=float, default=0.0)
-    parser.add_argument("--camera-k", nargs="+", type=float, default=None, metavar="VALUE")
-    parser.add_argument("--camera-k-json", type=Path, default=None)
-    parser.add_argument(
+    add_argument(parser, "--checkpoint", required=True, type=Path)
+    add_argument(parser, "--image", nargs="+", action="append", type=Path, default=[])
+    add_argument(parser, "--image-list", action="append", type=Path, default=[])
+    prediction_group = parser.add_mutually_exclusive_group()
+    add_argument(
+        prediction_group,
+        "--prediction-files",
+        action="store_true",
+        help="save prediction.json.gz in each numbered image directory",
+    )
+    add_argument(
+        prediction_group,
+        "-p",
+        "-o",
+        "--single-prediction-file",
+        "--output",
+        type=Path,
+        default=None,
+        help="save all image records into one JSON, JSON.GZ, or HDF5 file",
+    )
+    add_argument(parser, "--glb-models", action="store_true",
+                 help="save model.glb in each numbered image directory")
+    add_argument(parser, "--output-dir", type=Path, default=None)
+    add_argument(parser, "--batch-size", type=int, default=1)
+    add_argument(parser, "--num-workers", type=int, default=0)
+    add_argument(parser, "--device", default="cuda")
+    add_argument(parser, "--pred-threshold", type=float, default=0.0)
+    add_argument(parser, "--camera-k", nargs="+", type=float, default=None, metavar="VALUE")
+    add_argument(parser, "--camera-k-json", type=Path, default=None)
+    add_argument(
+        parser,
         "--camera-k-from-exif",
         action="store_true",
         help="estimate missing camera intrinsics from EXIF metadata",
     )
-    parser.add_argument("--save-visualizations", action="store_true")
-    parser.add_argument("--visualization-dir", type=Path, default=None)
-    parser.add_argument("--save-input", action="store_true", help="include transformed image tensors in raw_data")
+    add_argument(parser, "--save-visualizations", action="store_true")
+    add_argument(parser, "--visualization-dir", type=Path, default=None)
+    add_argument(parser, "--save-input", action="store_true", help="include transformed image tensors in raw_data")
     return parser
 
 
@@ -370,6 +402,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = make_parser().parse_args(argv)
     if args.batch_size < 1:
         raise ImageInferenceError("--batch-size must be at least 1.")
+    if not (
+        args.prediction_files
+        or args.single_prediction_file
+        or args.glb_models
+        or args.save_visualizations
+    ):
+        raise ImageInferenceError(
+            "Select at least one output: --prediction-files, --single-prediction-file, "
+            "--glb-models, or --save-visualizations."
+        )
+    if (args.prediction_files or args.glb_models) and args.output_dir is None:
+        raise ImageInferenceError("--output-dir is required with --prediction-files or --glb-models.")
 
     checkpoint_path = args.checkpoint.expanduser().resolve()
     if not checkpoint_path.is_file():
@@ -386,6 +430,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         model_args.linea3d = False
     if not hasattr(model_args, "line3d_pred_strategy"):
         model_args.line3d_pred_strategy = "direct"
+    if args.glb_models and not model_args.linea3d:
+        raise ImageInferenceError("--glb-models requires a LINEA3D checkpoint.")
     if str(getattr(model_args, "backbone", "")).startswith("HGNetv2"):
         model_args.pretrained = False
 
@@ -443,12 +489,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         num_workers=args.num_workers,
     )
 
-    output_path = (args.output or default_output_path(checkpoint_path)).expanduser().resolve()
+    output_path = (
+        args.single_prediction_file.expanduser().resolve()
+        if args.single_prediction_file is not None else None
+    )
+    output_directory = (
+        args.output_dir.expanduser().resolve()
+        if args.output_dir is not None else default_output_directory(checkpoint_path).resolve()
+    )
     visualization_dir = args.visualization_dir
     if visualization_dir is None:
-        visualization_dir = output_path.parent / "visualizations"
+        visualization_dir = output_directory
     visualization_dir = visualization_dir.expanduser().resolve()
 
+    file_meta = {
+        "codebase": {
+            "commit": _git_output("git", "rev-parse", "HEAD"),
+            "diff": _git_output("git", "diff", "HEAD"),
+        },
+        "export": {
+            "created_at_utc": utc_timestamp(),
+            "weights_path": os.path.abspath(checkpoint_path),
+            "device": str(device),
+            "prediction_threshold": args.pred_threshold,
+        },
+        "model": {
+            "training_dataset_name": getattr(model_args, "dataset_name", None),
+            "linea3d": bool(model_args.linea3d),
+            "line3d_pred_strategy": model_args.line3d_pred_strategy,
+        },
+    }
     records = []
     image_index = 0
     with torch.no_grad():
@@ -461,58 +531,79 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             for batch_index, target in enumerate(targets):
                 image_path = Path(target["image_path"])
-                record = PredictionRecord(
-                    record_id=f"image_{image_index:06d}",
-                    raw_data={
-                        "input": samples[batch_index] if args.save_input else {},
-                        "target": target,
-                        "output_raw": _sample_raw_outputs(raw_outputs, batch_index),
-                    },
-                    losses={},
-                    prediction=_build_prediction(
-                        raw_outputs, lines, scores, batch_index, args.pred_threshold
-                    ),
-                    meta={
-                        "image_path": str(image_path),
-                        "original_size": target["orig_size"],
-                        "camera_K": target.get("camera_K"),
-                        "camera_K_metadata": target.get("camera_K_metadata"),
-                    },
+                sample_directory = image_output_directory(
+                    output_directory, image_index, image_path
                 )
-                records.append(record)
+                if args.prediction_files or output_path is not None:
+                    record = PredictionRecord(
+                        record_id=f"image_{image_index:06d}",
+                        raw_data={
+                            "input": samples[batch_index] if args.save_input else {},
+                            "target": target,
+                            "output_raw": _sample_raw_outputs(raw_outputs, batch_index),
+                        },
+                        losses={},
+                        prediction=_build_prediction(
+                            raw_outputs, lines, scores, batch_index, args.pred_threshold
+                        ),
+                        meta={
+                            "image_path": str(image_path),
+                            "original_size": target["orig_size"],
+                            "camera_K": target.get("camera_K"),
+                            "camera_K_metadata": target.get("camera_K_metadata"),
+                        },
+                    )
+                    if args.prediction_files:
+                        prediction_file = make_prediction_file(
+                            dataset_name="images",
+                            codebase_name="LINEA",
+                            records=[record],
+                            meta=file_meta,
+                        )
+                        prediction_path = sample_directory / "prediction.json.gz"
+                        save(prediction_file, prediction_path)
+                        print(f"Saved prediction to {prediction_path}")
+                    else:
+                        records.append(record)
+
+                if args.glb_models:
+                    if "pred_lines3d" not in raw_outputs:
+                        raise ImageInferenceError(
+                            "LINEA3D output does not contain pred_lines3d."
+                        )
+                    keep = scores[batch_index] > args.pred_threshold
+                    model_path = sample_directory / "model.glb"
+                    save_line_model_glb(
+                        model_path,
+                        raw_outputs["pred_lines3d"][batch_index][keep],
+                        prediction_name="predictions_raw",
+                    )
+                    print(f"Saved 3D model to {model_path}")
 
                 if args.save_visualizations:
-                    visualization_dir.mkdir(parents=True, exist_ok=True)
+                    if args.visualization_dir is None:
+                        visualization_path = sample_directory / "visualization.png"
+                    else:
+                        visualization_path = (
+                            visualization_dir
+                            / f"{image_index + 1:03d}-{image_path.stem}.png"
+                        )
+                    visualization_path.parent.mkdir(parents=True, exist_ok=True)
                     image = _draw_prediction(
                         image_path, lines[batch_index], scores[batch_index], args.pred_threshold
                     )
-                    image.save(visualization_dir / f"{image_index:06d}_{image_path.stem}.png")
+                    image.save(visualization_path)
                 image_index += 1
 
-    prediction_file = make_prediction_file(
-        dataset_name="images",
-        codebase_name="LINEA",
-        records=records,
-        meta={
-            "codebase": {
-                "commit": _git_output("git", "rev-parse", "HEAD"),
-                "diff": _git_output("git", "diff", "HEAD"),
-            },
-            "export": {
-                "created_at_utc": utc_timestamp(),
-                "weights_path": os.path.abspath(checkpoint_path),
-                "device": str(device),
-                "prediction_threshold": args.pred_threshold,
-            },
-            "model": {
-                "training_dataset_name": getattr(model_args, "dataset_name", None),
-                "linea3d": bool(model_args.linea3d),
-                "line3d_pred_strategy": model_args.line3d_pred_strategy,
-            },
-        },
-    )
-    save(prediction_file, output_path)
-    print(f"Saved {len(records)} predictions to {output_path}")
+    if output_path is not None:
+        prediction_file = make_prediction_file(
+            dataset_name="images",
+            codebase_name="LINEA",
+            records=records,
+            meta=file_meta,
+        )
+        save(prediction_file, output_path)
+        print(f"Saved {len(records)} predictions to {output_path}")
     if args.save_visualizations:
         print(f"Saved visualizations to {visualization_dir}")
     return 0

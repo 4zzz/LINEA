@@ -8,7 +8,10 @@ Infer one image:
 ```bash
 venv314/bin/python tools/infer_images.py \
   --checkpoint output/experiment/checkpoint0009.pth \
-  --image path/to/image.jpg
+  --image path/to/image.jpg \
+  --prediction-files \
+  --glb-models \
+  --output-dir output/image_inference
 ```
 
 Infer several images and save PNG overlays:
@@ -18,7 +21,9 @@ venv314/bin/python tools/infer_images.py \
   --checkpoint output/experiment/checkpoint0009.pth \
   --image first.jpg second.jpg \
   --image third.jpg \
-  --save-visualizations
+  --prediction-files \
+  --save-visualizations \
+  --output-dir output/image_inference
 ```
 
 Paths can also be positional, or supplied through one or more newline-delimited
@@ -28,11 +33,31 @@ files. Blank lines and lines starting with `#` are ignored:
 venv314/bin/python tools/infer_images.py \
   --checkpoint output/experiment/checkpoint0009.pth \
   --image-list images.txt \
-  --output selected_images.json.gz
+  --single-prediction-file selected_images.json.gz
 ```
 
-By default, output is saved to
-`<checkpoint-dir>/inference/<checkpoint-name>_images/predictions.json.gz`.
+`--prediction-files` and `--single-prediction-file` are mutually exclusive.
+The former creates one directory per input image:
+
+```text
+output/image_inference/
+  001-first/
+    prediction.json.gz
+    model.glb
+    visualization.png
+  002-second/
+    prediction.json.gz
+    model.glb
+    visualization.png
+```
+
+`--prediction-files` and `--glb-models` require `--output-dir`. GLB models are
+available only for LINEA3D checkpoints. They contain thresholded predictions
+as native line-segment edges in the model's camera-coordinate space.
+
+The old `--output` spelling remains an alias for
+`--single-prediction-file`. Every long inference option accepts both hyphens
+and underscores, for example `--output-dir` and `--output_dir`.
 
 ## Camera intrinsics
 

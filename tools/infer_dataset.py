@@ -1,7 +1,6 @@
 import argparse
 import os
 from pathlib import Path
-import subprocess
 import sys
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +13,9 @@ from torch.utils.data import DataLoader, Subset
 from datasets import build_dataset, BatchImageCollateFunction
 import numpy as np
 from PIL import Image, ImageDraw
+from tools.inference_cli import add_argument
+from util.git_utils import git_output, git_repository_root
+from util.line_model_export import save_line_model_glb
 from util.prediction_record import PredictionRecord, make_prediction_file, save, utc_timestamp
 from util.slconfig import DictAction
 from models.linea.matcher import build_matcher
@@ -38,38 +40,55 @@ def draw(images, lines, scores, thrh=0.4):
 
     return images
 
-#if __name__ == '__main__':
 parser = argparse.ArgumentParser(
     'Produce inference files using trained model for all dataset samples',
     #parents=[get_args_parser(all_optional=True)],
 )
-parser.add_argument('--device', type=str, default='cuda')
-parser.add_argument('--split', type=str, choices=('test', 'val', 'train'), default='test')
-parser.add_argument('--batch_size', type=int, default=1)
-parser.add_argument('--num_workers', type=int, default=1)
-parser.add_argument('--model', type=str)
-parser.add_argument('--save_png_visualization', action='store_true', default=False)
-parser.add_argument('-d', '--dont_save_sample', action='store_true', default=False)
-parser.add_argument('-o', '--output_directory', type=str)
-parser.add_argument('--overwrite', action='store_true', default=False,
-                    help='Allow existing prediction and visualization files to be replaced.')
-parser.add_argument('--pred_threshold', type=float, default=0.0)
-parser.add_argument('--max_samples', type=int, default=None)
-parser.add_argument('--single_file', type=str, default=None,
-                    help='Save all prediction records into one JSON/JSON.GZ file instead of one file per sample.')
-parser.add_argument('--fit-affine', action='store_true', default=False,
-                    help='Fit training-style affine scale/shift from matched 2D lines and save prediction.lines3d_fitted.')
-parser.add_argument('--save-matching', action='store_true', default=False,
-                    help='Save the exact matcher assignment, cost components, and top alternatives.')
-parser.add_argument('--matching-top-k', type=int, default=5,
-                    help='Number of lowest-cost prediction alternatives to save for each target line.')
-parser.add_argument('--save-full-matching-cost-matrix', action='store_true', default=False,
-                    help='Save all matcher cost matrices. This implies --save-matching and can make files large.')
-parser.add_argument('--sample-index', type=int, default=None,
-                    help='Run inference for one zero-based dataset index.')
-parser.add_argument(
+add_argument(parser, '--device', type=str, default='cuda')
+add_argument(parser, '--split', type=str, choices=('test', 'val', 'train'), default='test')
+add_argument(parser, '--batch-size', type=int, default=1)
+add_argument(parser, '--num-workers', type=int, default=1)
+add_argument(parser, '--model', type=str)
+add_argument(parser, '--save-png-visualization', action='store_true', default=False)
+add_argument(parser, '-d', '--dont-save-sample', action='store_true', default=False)
+add_argument(parser, '-o', '--output-directory', type=str)
+add_argument(parser, '--overwrite', action='store_true', default=False,
+             help='Allow existing prediction, model, and visualization files to be replaced.')
+add_argument(parser, '--pred-threshold', type=float, default=0.0)
+add_argument(parser, '--max-samples', type=int, default=None)
+prediction_group = parser.add_mutually_exclusive_group()
+add_argument(
+    prediction_group,
+    '--prediction-files',
+    action='store_true',
+    help='Save one eval_NNN.json.gz prediction file per dataset sample.',
+)
+add_argument(
+    prediction_group,
+    '-p',
+    '--single-prediction-file',
+    '--single-file',
+    type=str,
+    default=None,
+    help='Save all prediction records into one JSON, JSON.GZ, or HDF5 file.',
+)
+add_argument(parser, '--glb-models', action='store_true',
+             help='Save one eval_NNN.glb 3D line model per dataset sample.')
+add_argument(parser, '--model-add-ground-truth', action='store_true',
+             help='Include dataset ground-truth lines as a separate colored node in GLB models.')
+add_argument(parser, '--fit-affine', action='store_true', default=False,
+             help='Fit training-style affine scale/shift from matched 2D lines and use fitted 3D predictions.')
+add_argument(parser, '--save-matching', action='store_true', default=False,
+             help='Save the exact matcher assignment, cost components, and top alternatives.')
+add_argument(parser, '--matching-top-k', type=int, default=5,
+             help='Number of lowest-cost prediction alternatives to save for each target line.')
+add_argument(parser, '--save-full-matching-cost-matrix', action='store_true', default=False,
+             help='Save all matcher cost matrices. This implies --save-matching and can make files large.')
+add_argument(parser, '--sample-index', type=int, default=None,
+             help='Run inference for one zero-based dataset index.')
+add_argument(
+    parser,
     '--set_model_args',
-    '--set-model-args',
     nargs='+',
     action=DictAction,
     default=None,
@@ -80,149 +99,170 @@ parser.add_argument(
     ),
 )
 
-args = parser.parse_args()
+if __name__ == '__main__':
+    args = parser.parse_args()
 
-checkpoint = torch.load(args.model, map_location="cpu", weights_only=False)
-model_args = checkpoint['args']
-training_output_dir = getattr(model_args, 'output_dir', None)
-model_args_overrides = args.set_model_args or {}
-for key, value in model_args_overrides.items():
-    previous = getattr(model_args, key, '<not set>')
-    print(f"Overriding model_args.{key}: {previous!r} -> {value!r}")
-    setattr(model_args, key, value)
-if getattr(model_args, 'output_dir', None) is not None:
-    print('Clearing model_args.output_dir for inference safety.')
-model_args.output_dir = None
-if not hasattr(model_args, 'linea3d'):
-    model_args.linea3d = False
-if not hasattr(model_args, 'line3d_pred_strategy'):
-    model_args.line3d_pred_strategy = 'direct'
+    checkpoint = torch.load(args.model, map_location="cpu", weights_only=False)
+    model_args = checkpoint['args']
+    training_output_dir = getattr(model_args, 'output_dir', None)
+    model_args_overrides = args.set_model_args or {}
+    for key, value in model_args_overrides.items():
+        previous = getattr(model_args, key, '<not set>')
+        print(f"Overriding model_args.{key}: {previous!r} -> {value!r}")
+        setattr(model_args, key, value)
+    if getattr(model_args, 'output_dir', None) is not None:
+        print('Clearing model_args.output_dir for inference safety.')
+    model_args.output_dir = None
+    if not hasattr(model_args, 'linea3d'):
+        model_args.linea3d = False
+    if not hasattr(model_args, 'line3d_pred_strategy'):
+        model_args.line3d_pred_strategy = 'direct'
 
-#for name, value in vars(args).items():
-#    if name in model_args:
-#        print(f"Overriding value of '{name}' in model config from {getattr(model_args, name)} to {value}")
-#        setattr(model_args, name, value)
+    #for name, value in vars(args).items():
+    #    if name in model_args:
+    #        print(f"Overriding value of '{name}' in model config from {getattr(model_args, name)} to {value}")
+    #        setattr(model_args, name, value)
 
-def create(args, classname):
-    # we use register to maintain models from catdet6 on.
-    from models.registry import MODULE_BUILD_FUNCS
-    class_module = getattr(args, classname)
-    assert class_module in MODULE_BUILD_FUNCS._module_dict
-    build_func = MODULE_BUILD_FUNCS.get(class_module)
-    return build_func(args)
+    def create(args, classname):
+        # we use register to maintain models from catdet6 on.
+        from models.registry import MODULE_BUILD_FUNCS
+        class_module = getattr(args, classname)
+        assert class_module in MODULE_BUILD_FUNCS._module_dict
+        build_func = MODULE_BUILD_FUNCS.get(class_module)
+        return build_func(args)
 
-# build model
-model, postprocessor = create(model_args, 'modelname')
+    # build model
+    model, postprocessor = create(model_args, 'modelname')
 
-if "ema" in checkpoint:
-    state = checkpoint["ema"]["module"]
-else:
-    state = checkpoint["model"]
-model.load_state_dict(state)
+    if "ema" in checkpoint:
+        state = checkpoint["ema"]["module"]
+    else:
+        state = checkpoint["model"]
+    model.load_state_dict(state)
 
-device = args.device
-if device.startswith('cuda') and not torch.cuda.is_available():
-    print("CUDA requested but not available, falling back to CPU.")
-    device = 'cpu'
+    device = args.device
+    if device.startswith('cuda') and not torch.cuda.is_available():
+        print("CUDA requested but not available, falling back to CPU.")
+        device = 'cpu'
 
-class Model(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.model = model.deploy()
-        self.postprocessor = postprocessor.deploy()
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = model.deploy()
+            self.postprocessor = postprocessor.deploy()
 
-    def forward(self, images, orig_target_sizes, targets=None):
-        raw_outputs = self.model(images, targets)
-        lines, scores = self.postprocessor(raw_outputs, orig_target_sizes)
-        return raw_outputs, lines, scores
+        def forward(self, images, orig_target_sizes, targets=None):
+            raw_outputs = self.model(images, targets)
+            lines, scores = self.postprocessor(raw_outputs, orig_target_sizes)
+            return raw_outputs, lines, scores
 
-dataset = build_dataset(image_set=args.split, args=model_args, write_dataset_info=False)
-if args.sample_index is not None:
-    if not 0 <= args.sample_index < len(dataset):
-        parser.error(f'--sample-index must be between 0 and {len(dataset) - 1}.')
-    dataset = Subset(dataset, [args.sample_index])
-if args.matching_top_k < 0:
-    parser.error('--matching-top-k must be non-negative.')
+    dataset = build_dataset(image_set=args.split, args=model_args, write_dataset_info=False)
+    if args.sample_index is not None:
+        if not 0 <= args.sample_index < len(dataset):
+            parser.error(f'--sample-index must be between 0 and {len(dataset) - 1}.')
+        dataset = Subset(dataset, [args.sample_index])
+    if args.matching_top_k < 0:
+        parser.error('--matching-top-k must be non-negative.')
 
-if model_args.eval_spatial_size is not None:
-    collate_fn = BatchImageCollateFunction(base_size=model_args.eval_spatial_size[0])
-else:
-    collate_fn = BatchImageCollateFunction()
+    if model_args.eval_spatial_size is not None:
+        collate_fn = BatchImageCollateFunction(base_size=model_args.eval_spatial_size[0])
+    else:
+        collate_fn = BatchImageCollateFunction()
 
-dataloader = DataLoader(
-    dataset,
-    args.batch_size,
-    #sampler=sampler_val,
-    drop_last=False,
-    collate_fn=collate_fn,
-    num_workers=args.num_workers,
-)
-
-model = Model().to(device)
-model.eval()
-
-save_matching = args.save_matching or args.save_full_matching_cost_matrix
-matcher = build_matcher(model_args) if args.fit_affine or save_matching else None
-
-output_directory = Path(args.output_directory) if args.output_directory is not None else None
-if output_directory is None and args.single_file is None:
-    parser.error('--output_directory is required unless --single_file is set.')
-if args.save_png_visualization and output_directory is None:
-    parser.error('--output_directory is required when --save_png_visualization is set.')
-
-single_file_path = None
-if args.single_file is not None:
-    single_file_path = Path(args.single_file)
-    if not single_file_path.is_absolute() and output_directory is not None:
-        single_file_path = output_directory / single_file_path
-
-if args.max_samples is not None and args.max_samples < 0:
-    parser.error('--max_samples must be non-negative.')
-
-if args.sample_index is not None:
-    planned_dataset_indices = [args.sample_index]
-else:
-    planned_dataset_indices = list(range(len(dataset)))
-if args.max_samples is not None:
-    planned_dataset_indices = planned_dataset_indices[:args.max_samples]
-
-planned_output_paths = []
-if single_file_path is not None:
-    planned_output_paths.append(single_file_path)
-else:
-    planned_output_paths.extend(
-        output_directory / f'eval_{index:03}.json.gz'
-        for index in planned_dataset_indices
-    )
-if args.save_png_visualization:
-    planned_output_paths.extend(
-        output_directory / f'eval_{index:03}.png'
-        for index in planned_dataset_indices
+    dataloader = DataLoader(
+        dataset,
+        args.batch_size,
+        #sampler=sampler_val,
+        drop_last=False,
+        collate_fn=collate_fn,
+        num_workers=args.num_workers,
     )
 
-if len(set(planned_output_paths)) != len(planned_output_paths):
-    parser.error('Inference output paths collide; choose a different --single_file path.')
+    model = Model().to(device)
+    model.eval()
 
-if not args.overwrite:
-    existing_paths = [path for path in planned_output_paths if path.exists()]
-    if existing_paths:
-        preview = ', '.join(str(path) for path in existing_paths[:3])
-        if len(existing_paths) > 3:
-            preview += f", ... (+{len(existing_paths) - 3} more)"
+    save_matching = args.save_matching or args.save_full_matching_cost_matrix
+    matcher = build_matcher(model_args) if args.fit_affine or save_matching else None
+
+    output_directory = Path(args.output_directory) if args.output_directory is not None else None
+    uses_output_directory = args.prediction_files or args.glb_models or args.save_png_visualization
+    if uses_output_directory and output_directory is None:
         parser.error(
-            f'Refusing to overwrite existing output files: {preview}. '
-            'Pass --overwrite to replace them.'
+            '--output-directory is required with --prediction-files, --glb-models, '
+            'or --save-png-visualization.'
+        )
+    if not (uses_output_directory or args.single_prediction_file):
+        parser.error(
+            'Select at least one output: --prediction-files, --single-prediction-file, '
+            '--glb-models, or --save-png-visualization.'
+        )
+    if args.model_add_ground_truth and not args.glb_models:
+        parser.error('--model-add-ground-truth requires --glb-models.')
+    if (args.save_matching or args.save_full_matching_cost_matrix) and not (
+        args.prediction_files or args.single_prediction_file
+    ):
+        parser.error('--save-matching requires a prediction-file output mode.')
+    if args.glb_models and not model_args.linea3d:
+        parser.error('--glb-models requires a LINEA3D checkpoint.')
+
+    single_file_path = None
+    if args.single_prediction_file is not None:
+        single_file_path = Path(args.single_prediction_file)
+        if not single_file_path.is_absolute() and output_directory is not None:
+            single_file_path = output_directory / single_file_path
+
+    if args.max_samples is not None and args.max_samples < 0:
+        parser.error('--max_samples must be non-negative.')
+
+    if args.sample_index is not None:
+        planned_dataset_indices = [args.sample_index]
+    else:
+        planned_dataset_indices = list(range(len(dataset)))
+    if args.max_samples is not None:
+        planned_dataset_indices = planned_dataset_indices[:args.max_samples]
+
+    planned_output_paths = []
+    if single_file_path is not None:
+        planned_output_paths.append(single_file_path)
+    if args.prediction_files:
+        planned_output_paths.extend(
+            output_directory / f'eval_{index:03}.json.gz'
+            for index in planned_dataset_indices
+        )
+    if args.glb_models:
+        planned_output_paths.extend(
+            output_directory / f'eval_{index:03}.glb'
+            for index in planned_dataset_indices
+        )
+    if args.save_png_visualization:
+        planned_output_paths.extend(
+            output_directory / f'eval_{index:03}.png'
+            for index in planned_dataset_indices
         )
 
-if output_directory is not None:
-    output_directory.mkdir(parents=True, exist_ok=True)
+    if len(set(planned_output_paths)) != len(planned_output_paths):
+        parser.error('Inference output paths collide; choose a different output path.')
+
+    if not args.overwrite:
+        existing_paths = [path for path in planned_output_paths if path.exists()]
+        if existing_paths:
+            preview = ', '.join(str(path) for path in existing_paths[:3])
+            if len(existing_paths) > 3:
+                preview += f", ... (+{len(existing_paths) - 3} more)"
+            parser.error(
+                f'Refusing to overwrite existing output files: {preview}. '
+                'Pass --overwrite to replace them.'
+            )
+
+    if output_directory is not None:
+        output_directory.mkdir(parents=True, exist_ok=True)
+
+
+git_root = git_repository_root(REPO_ROOT)
 
 
 def _git_output(*cmd):
-    try:
-        return subprocess.check_output(cmd, cwd=Path(__file__).resolve().parent, text=True).strip()
-    except Exception:
-        return None
+    return git_output(cmd, git_root)
 
 
 def _move_targets_to_device(targets, device):
@@ -488,149 +528,180 @@ def _raw_output_for_record(raw_outputs, idx):
     return sample_output
 
 
-file_meta = {
-    'codebase': {
-        'commit': _git_output('git', 'rev-parse', 'HEAD'),
-        'diff': _git_output('git', 'diff', 'HEAD'),
-    },
-    'export': {
-        'created_at_utc': utc_timestamp(),
-        'weights_path': os.path.abspath(args.model),
-        'split': args.split,
-        'fit_affine': args.fit_affine,
-        'save_matching': save_matching,
-        'matching_top_k': args.matching_top_k,
-        'save_full_matching_cost_matrix': args.save_full_matching_cost_matrix,
-        'sample_index': args.sample_index,
-        'model_args_overrides': model_args_overrides,
-        'training_output_dir': training_output_dir,
-        'overwrite': args.overwrite,
-        'line3d_alignment': getattr(model_args, 'line3d_alignment', None),
+if __name__ == '__main__':
+    file_meta = {
+        'codebase': {
+            'commit': _git_output('git', 'rev-parse', 'HEAD'),
+            'diff': _git_output('git', 'diff', 'HEAD'),
+        },
+        'export': {
+            'created_at_utc': utc_timestamp(),
+            'weights_path': os.path.abspath(args.model),
+            'split': args.split,
+            'fit_affine': args.fit_affine,
+            'save_matching': save_matching,
+            'matching_top_k': args.matching_top_k,
+            'save_full_matching_cost_matrix': args.save_full_matching_cost_matrix,
+            'sample_index': args.sample_index,
+            'model_args_overrides': model_args_overrides,
+            'training_output_dir': training_output_dir,
+            'overwrite': args.overwrite,
+            'prediction_files': args.prediction_files,
+            'single_prediction_file': None if single_file_path is None else str(single_file_path),
+            'glb_models': args.glb_models,
+            'model_add_ground_truth': args.model_add_ground_truth,
+            'line3d_alignment': getattr(model_args, 'line3d_alignment', None),
+        }
     }
-}
 
-i = 0
-single_file_records = []
-with torch.no_grad():
-    for samples, targets in dataloader:
-        if args.max_samples is not None and i >= args.max_samples:
-            break
-
-        orig_target_sizes = np.array([[tgt['orig_size'][1].item(), tgt['orig_size'][0].item()] for tgt in targets])
-
-        targets_device = _move_targets_to_device(targets, device)
-        raw_outputs, lines, scores = model(
-            samples.to(device),
-            torch.tensor(orig_target_sizes).to(device),
-            targets_device,
-        )
-        if matcher is not None:
-            matching_costs = matcher.compute_costs(raw_outputs, targets_device)
-            indices = matcher.match_from_costs(matching_costs)
-        else:
-            matching_costs = None
-            indices = None
-
-        if indices is not None and (args.fit_affine or save_matching):
-            fitted_lines3d, alignment_info = _fit_affine_lines3d(
-                raw_outputs,
-                targets_device,
-                indices,
-                getattr(model_args, 'line3d_alignment', 'xyz_shift'),
-                getattr(model_args, 'line3d_loss_type', 'l1'),
-                getattr(model_args, 'line3d_smooth_l1_beta', 1.0),
-            )
-        else:
-            fitted_lines3d = None
-            alignment_info = None
-
-        pil_imgs = [Image.open(tgt['image_path']).convert("RGB") for tgt in targets]
-        vis = draw(pil_imgs, lines, scores, thrh=args.pred_threshold)
-
-        for idx in range(len(targets)):
+    i = 0
+    single_file_records = []
+    with torch.no_grad():
+        for samples, targets in dataloader:
             if args.max_samples is not None and i >= args.max_samples:
                 break
 
-            dataset_index = args.sample_index if args.sample_index is not None else i
-            sample_matching = {}
-            if save_matching:
-                sample_matching = _build_matching_record(
-                    matcher=matcher,
-                    costs=matching_costs[idx],
-                    indices=indices[idx],
-                    raw_outputs=raw_outputs,
-                    lines2d=lines,
-                    scores=scores,
-                    target=targets_device[idx],
-                    batch_index=idx,
-                    top_k=args.matching_top_k,
-                    include_full_matrix=args.save_full_matching_cost_matrix,
-                    alignment_info=None if alignment_info is None else alignment_info[idx],
-                )
+            orig_target_sizes = np.array([[tgt['orig_size'][1].item(), tgt['orig_size'][0].item()] for tgt in targets])
 
-            record_meta = {
-                'dataset': {
-                    'split': args.split,
-                    'index': dataset_index,
-                    'image_path': targets[idx].get('image_path'),
-                    'image_id': targets[idx].get('image_id'),
-                    'orig_size': targets[idx].get('orig_size'),
-                },
-                'model': {
-                    'weights_path': os.path.abspath(args.model),
-                },
-                'runtime': {
-                    'device': args.device,
-                },
-            }
-            if save_matching:
-                record_meta['matching'] = sample_matching
-
-            record = PredictionRecord(
-                record_id=f"{args.split}_{dataset_index:06d}",
-                raw_data={
-                    'input': {} if args.dont_save_sample else samples[idx],
-                    'target': targets[idx],
-                    'output_raw': _raw_output_for_record(raw_outputs, idx),
-                },
-                losses={},
-                prediction=_build_predictions(
-                    lines,
-                    scores,
-                    raw_outputs,
-                    idx,
-                    args.pred_threshold,
-                    fitted_lines3d if args.fit_affine else None,
-                ),
-                meta=record_meta,
+            targets_device = _move_targets_to_device(targets, device)
+            raw_outputs, lines, scores = model(
+                samples.to(device),
+                torch.tensor(orig_target_sizes).to(device),
+                targets_device,
             )
-            if single_file_path is not None:
-                single_file_records.append(record)
-                print('adding prediction data', i)
+            if matcher is not None:
+                matching_costs = matcher.compute_costs(raw_outputs, targets_device)
+                indices = matcher.match_from_costs(matching_costs)
             else:
-                prediction_file = make_prediction_file(
-                    dataset_name=model_args.dataset_name,
-                    codebase_name='LINEA',
-                    records=[record],
-                    meta=file_meta,
-                )
+                matching_costs = None
+                indices = None
 
-                prediction_path = output_directory / f'eval_{dataset_index:03}.json.gz'
-                save(prediction_file, prediction_path)
-                print('saving prediction data to', prediction_path)
+            if indices is not None and (args.fit_affine or save_matching):
+                fitted_lines3d, alignment_info = _fit_affine_lines3d(
+                    raw_outputs,
+                    targets_device,
+                    indices,
+                    getattr(model_args, 'line3d_alignment', 'xyz_shift'),
+                    getattr(model_args, 'line3d_loss_type', 'l1'),
+                    getattr(model_args, 'line3d_smooth_l1_beta', 1.0),
+                )
+            else:
+                fitted_lines3d = None
+                alignment_info = None
 
             if args.save_png_visualization:
-                png_path = output_directory / f'eval_{dataset_index:03}.png'
-                vis[idx].save(png_path)
+                pil_imgs = [Image.open(tgt['image_path']).convert("RGB") for tgt in targets]
+                vis = draw(pil_imgs, lines, scores, thrh=args.pred_threshold)
+            else:
+                vis = None
 
-            i += 1
+            for idx in range(len(targets)):
+                if args.max_samples is not None and i >= args.max_samples:
+                    break
 
-if single_file_path is not None:
-    prediction_file = make_prediction_file(
-        dataset_name=model_args.dataset_name,
-        codebase_name='LINEA',
-        records=single_file_records,
-        meta=file_meta,
-    )
-    save(prediction_file, single_file_path)
-    print('saving prediction data to', single_file_path)
+                dataset_index = args.sample_index if args.sample_index is not None else i
+                sample_matching = {}
+                if save_matching:
+                    sample_matching = _build_matching_record(
+                        matcher=matcher,
+                        costs=matching_costs[idx],
+                        indices=indices[idx],
+                        raw_outputs=raw_outputs,
+                        lines2d=lines,
+                        scores=scores,
+                        target=targets_device[idx],
+                        batch_index=idx,
+                        top_k=args.matching_top_k,
+                        include_full_matrix=args.save_full_matching_cost_matrix,
+                        alignment_info=None if alignment_info is None else alignment_info[idx],
+                    )
+
+                if args.prediction_files or single_file_path is not None:
+                    record_meta = {
+                        'dataset': {
+                            'split': args.split,
+                            'index': dataset_index,
+                            'image_path': targets[idx].get('image_path'),
+                            'image_id': targets[idx].get('image_id'),
+                            'orig_size': targets[idx].get('orig_size'),
+                        },
+                        'model': {
+                            'weights_path': os.path.abspath(args.model),
+                        },
+                        'runtime': {
+                            'device': args.device,
+                        },
+                    }
+                    if save_matching:
+                        record_meta['matching'] = sample_matching
+
+                    record = PredictionRecord(
+                        record_id=f"{args.split}_{dataset_index:06d}",
+                        raw_data={
+                            'input': {} if args.dont_save_sample else samples[idx],
+                            'target': targets[idx],
+                            'output_raw': _raw_output_for_record(raw_outputs, idx),
+                        },
+                        losses={},
+                        prediction=_build_predictions(
+                            lines,
+                            scores,
+                            raw_outputs,
+                            idx,
+                            args.pred_threshold,
+                            fitted_lines3d if args.fit_affine else None,
+                        ),
+                        meta=record_meta,
+                    )
+                    if single_file_path is not None:
+                        single_file_records.append(record)
+                        print('adding prediction data', i)
+                    else:
+                        prediction_file = make_prediction_file(
+                            dataset_name=model_args.dataset_name,
+                            codebase_name='LINEA',
+                            records=[record],
+                            meta=file_meta,
+                        )
+
+                        prediction_path = output_directory / f'eval_{dataset_index:03}.json.gz'
+                        save(prediction_file, prediction_path)
+                        print('saving prediction data to', prediction_path)
+
+                if args.glb_models:
+                    if 'pred_lines3d' not in raw_outputs:
+                        raise RuntimeError('LINEA3D output does not contain pred_lines3d.')
+                    model_lines = raw_outputs['pred_lines3d'][idx]
+                    prediction_name = 'predictions_raw'
+                    if args.fit_affine and fitted_lines3d[idx] is not None:
+                        model_lines = fitted_lines3d[idx]
+                        prediction_name = 'predictions_affine_fitted'
+                    keep = scores[idx] > args.pred_threshold
+                    ground_truth = (
+                        targets_device[idx].get('lines3d')
+                        if args.model_add_ground_truth else None
+                    )
+                    model_path = output_directory / f'eval_{dataset_index:03}.glb'
+                    save_line_model_glb(
+                        model_path,
+                        model_lines[keep],
+                        ground_truth,
+                        prediction_name=prediction_name,
+                    )
+                    print('saving 3D model to', model_path)
+
+                if args.save_png_visualization:
+                    png_path = output_directory / f'eval_{dataset_index:03}.png'
+                    vis[idx].save(png_path)
+
+                i += 1
+
+    if single_file_path is not None:
+        prediction_file = make_prediction_file(
+            dataset_name=model_args.dataset_name,
+            codebase_name='LINEA',
+            records=single_file_records,
+            meta=file_meta,
+        )
+        save(prediction_file, single_file_path)
+        print('saving prediction data to', single_file_path)
