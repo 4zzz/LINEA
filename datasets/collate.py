@@ -50,11 +50,21 @@ class BatchImageCollateFunction(BaseCollateFunction):
 
     def __call__(self, items):
         images = [x[0] for x in items]
-        targets = [x[1] for x in items]
+        targets = [x[1].copy() for x in items]
 
         if self.scales is not None: # and self.epoch < self.stop_epoch:
             sz = random.choice(self.scales)
+            original_sizes = [image.shape[-2:] for image in images]
             images = resize(torch.cat([img[None] for img in images], dim=0), [sz, sz])
+            for target, (original_h, original_w) in zip(targets, original_sizes):
+                if "camera_K" in target:
+                    camera_k = target["camera_K"].clone()
+                    camera_k[0, 0] *= sz / original_w
+                    camera_k[0, 2] *= sz / original_w
+                    camera_k[1, 1] *= sz / original_h
+                    camera_k[1, 2] *= sz / original_h
+                    target["camera_K"] = camera_k
+                target["size"] = torch.tensor([sz, sz])
         else:
             max_h = max(img.shape[-2] for img in images)
             max_w = max(img.shape[-1] for img in images)
@@ -62,6 +72,17 @@ class BatchImageCollateFunction(BaseCollateFunction):
             target_w = max(max_w, 640)
             target_h += (32 - target_h % 32) % 32
             target_w += (32 - target_w % 32) % 32
+            for image, target in zip(images, targets):
+                original_h, original_w = image.shape[-2:]
+                if "lines" in target:
+                    line_scale = target["lines"].new_tensor([
+                        original_w / target_w,
+                        original_h / target_h,
+                        original_w / target_w,
+                        original_h / target_h,
+                    ])
+                    target["lines"] = target["lines"] * line_scale
+                target["size"] = torch.tensor([target_h, target_w])
             images = torch.stack([
                 F.pad(img, (0, target_w - img.shape[-1], 0, target_h - img.shape[-2]))
                 for img in images
