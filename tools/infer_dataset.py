@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import argparse
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ from datasets import build_dataset, BatchImageCollateFunction
 import numpy as np
 from PIL import Image, ImageDraw
 from tools.inference_cli import add_argument
+from tools.simple_prediction import build_simple_prediction, save_simple_prediction
 from util.git_utils import git_output, git_repository_root
 from util.line_model_export import save_line_model_glb
 from util.prediction_record import PredictionRecord, make_prediction_file, save, utc_timestamp
@@ -74,6 +76,13 @@ add_argument(
 )
 add_argument(parser, '--glb-models', action='store_true',
              help='Save one eval_NNN.glb 3D line model per dataset sample.')
+add_argument(
+    parser,
+    '--simple-json-files',
+    '--simple-json',
+    action='store_true',
+    help='Save compact eval_NNN.json files containing predicted lines and scores.',
+)
 add_argument(parser, '--model-add-ground-truth', action='store_true',
              help='Include dataset ground-truth lines as a separate colored node in GLB models.')
 add_argument(parser, '--fit-affine', action='store_true', default=False,
@@ -185,16 +194,21 @@ if __name__ == '__main__':
     matcher = build_matcher(model_args) if args.fit_affine or save_matching else None
 
     output_directory = Path(args.output_directory) if args.output_directory is not None else None
-    uses_output_directory = args.prediction_files or args.glb_models or args.save_png_visualization
+    uses_output_directory = (
+        args.prediction_files
+        or args.simple_json_files
+        or args.glb_models
+        or args.save_png_visualization
+    )
     if uses_output_directory and output_directory is None:
         parser.error(
-            '--output-directory is required with --prediction-files, --glb-models, '
-            'or --save-png-visualization.'
+            '--output-directory is required with --prediction-files, --simple-json, '
+            '--glb-models, or --save-png-visualization.'
         )
     if not (uses_output_directory or args.single_prediction_file):
         parser.error(
             'Select at least one output: --prediction-files, --single-prediction-file, '
-            '--glb-models, or --save-png-visualization.'
+            '--simple-json, --glb-models, or --save-png-visualization.'
         )
     if args.model_add_ground_truth and not args.glb_models:
         parser.error('--model-add-ground-truth requires --glb-models.')
@@ -227,6 +241,11 @@ if __name__ == '__main__':
     if args.prediction_files:
         planned_output_paths.extend(
             output_directory / f'eval_{index:03}.json.gz'
+            for index in planned_dataset_indices
+        )
+    if args.simple_json_files:
+        planned_output_paths.extend(
+            output_directory / f'eval_{index:03}.json'
             for index in planned_dataset_indices
         )
     if args.glb_models:
@@ -689,6 +708,22 @@ if __name__ == '__main__':
                         prediction_name=prediction_name,
                     )
                     print('saving 3D model to', model_path)
+
+                if args.simple_json_files:
+                    fitted_sample = None
+                    if args.fit_affine and fitted_lines3d[idx] is not None:
+                        fitted_sample = fitted_lines3d[idx]
+                    simple_prediction = build_simple_prediction(
+                        lines,
+                        scores,
+                        idx,
+                        args.pred_threshold,
+                        raw_outputs=raw_outputs,
+                        fitted_lines3d=fitted_sample,
+                    )
+                    simple_path = output_directory / f'eval_{dataset_index:03}.json'
+                    save_simple_prediction(simple_path, simple_prediction)
+                    print('saving simple prediction to', simple_path)
 
                 if args.save_png_visualization:
                     png_path = output_directory / f'eval_{dataset_index:03}.png'

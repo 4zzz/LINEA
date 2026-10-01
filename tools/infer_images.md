@@ -14,6 +14,19 @@ venv314/bin/python tools/infer_images.py \
   --output-dir output/image_inference
 ```
 
+For a compact JSON containing only thresholded line arrays and scores, use:
+
+```bash
+venv314/bin/python tools/infer_images.py \
+  --checkpoint output/experiment/checkpoint0009.pth \
+  --image path/to/image.jpg \
+  --simple-json \
+  --output-dir output/image_inference
+```
+
+This writes `001-image/prediction.json`. The file contains parallel `scores`
+and `lines2d` arrays, plus `lines3d` when the checkpoint predicts 3D lines.
+
 Infer several images and save PNG overlays:
 
 ```bash
@@ -51,9 +64,10 @@ output/image_inference/
     visualization.png
 ```
 
-`--prediction-files` and `--glb-models` require `--output-dir`. GLB models are
-available only for LINEA3D checkpoints. They contain thresholded predictions
-as native line-segment edges in the model's camera-coordinate space.
+`--prediction-files`, `--simple-json`, and `--glb-models` require
+`--output-dir`. GLB models are available only for LINEA3D checkpoints. They
+contain thresholded predictions as native line-segment edges in the model's
+camera-coordinate space.
 
 The old `--output` spelling remains an alias for
 `--single-prediction-file`. Every long inference option accepts both hyphens

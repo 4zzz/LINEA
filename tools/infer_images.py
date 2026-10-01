@@ -25,6 +25,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from datasets import BatchImageCollateFunction
 from tools.inference_cli import add_argument
+from tools.simple_prediction import build_simple_prediction, save_simple_prediction
 from util.git_utils import git_output, git_repository_root
 from util.line_model_export import save_line_model_glb
 from util.prediction_record import PredictionRecord, make_prediction_file, save, utc_timestamp
@@ -379,6 +380,13 @@ def make_parser():
     )
     add_argument(parser, "--glb-models", action="store_true",
                  help="save model.glb in each numbered image directory")
+    add_argument(
+        parser,
+        "--simple-json-files",
+        "--simple-json",
+        action="store_true",
+        help="save compact prediction.json files containing lines and scores",
+    )
     add_argument(parser, "--output-dir", type=Path, default=None)
     add_argument(parser, "--batch-size", type=int, default=1)
     add_argument(parser, "--num-workers", type=int, default=0)
@@ -406,14 +414,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.prediction_files
         or args.single_prediction_file
         or args.glb_models
+        or args.simple_json_files
         or args.save_visualizations
     ):
         raise ImageInferenceError(
             "Select at least one output: --prediction-files, --single-prediction-file, "
-            "--glb-models, or --save-visualizations."
+            "--simple-json, --glb-models, or --save-visualizations."
         )
-    if (args.prediction_files or args.glb_models) and args.output_dir is None:
-        raise ImageInferenceError("--output-dir is required with --prediction-files or --glb-models.")
+    if (args.prediction_files or args.simple_json_files or args.glb_models) and args.output_dir is None:
+        raise ImageInferenceError(
+            "--output-dir is required with --prediction-files, --simple-json, or --glb-models."
+        )
 
     checkpoint_path = args.checkpoint.expanduser().resolve()
     if not checkpoint_path.is_file():
@@ -579,6 +590,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                         prediction_name="predictions_raw",
                     )
                     print(f"Saved 3D model to {model_path}")
+
+                if args.simple_json_files:
+                    simple_path = sample_directory / "prediction.json"
+                    simple_prediction = build_simple_prediction(
+                        lines,
+                        scores,
+                        batch_index,
+                        args.pred_threshold,
+                        raw_outputs=raw_outputs,
+                    )
+                    save_simple_prediction(simple_path, simple_prediction)
+                    print(f"Saved simple prediction to {simple_path}")
 
                 if args.save_visualizations:
                     if args.visualization_dir is None:

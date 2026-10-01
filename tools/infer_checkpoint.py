@@ -68,6 +68,7 @@ def build_command(
     save_png_visualization: bool,
     passthrough: Sequence[str],
     python: str,
+    simple_json_files: bool = False,
 ) -> list[str]:
     command = [
         python,
@@ -95,6 +96,8 @@ def build_command(
         command.extend(['--max_samples', str(max_samples)])
     if prediction_files:
         command.append('--prediction-files')
+    if simple_json_files:
+        command.append('--simple-json')
     if single_prediction_file is not None:
         command.extend(['--single-prediction-file', single_prediction_file])
     if glb_models:
@@ -130,6 +133,13 @@ def make_parser() -> argparse.ArgumentParser:
         default=None,
     )
     add_argument(parser, '--glb-models', action='store_true')
+    add_argument(
+        parser,
+        '--simple-json-files',
+        '--simple-json',
+        action='store_true',
+        help='Save compact per-sample JSON files containing lines and scores.',
+    )
     add_argument(parser, '--model-add-ground-truth', action='store_true')
     add_argument(parser, '--save-png-visualization', action='store_true')
     add_argument(
@@ -155,11 +165,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.prediction_files
         or args.single_prediction_file
         or args.glb_models
+        or args.simple_json_files
         or args.save_png_visualization
     ):
         parser.error(
             'Select at least one output: --prediction-files, --single-prediction-file, '
-            '--glb-models, or --save-png-visualization.'
+            '--simple-json, --glb-models, or --save-png-visualization.'
         )
     if args.model_add_ground_truth and not args.glb_models:
         parser.error('--model-add-ground-truth requires --glb-models.')
@@ -201,6 +212,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         save_png_visualization=args.save_png_visualization,
         passthrough=passthrough,
         python=args.python,
+        simple_json_files=args.simple_json_files,
     )
 
     print(f"Checkpoint: {checkpoint}")
