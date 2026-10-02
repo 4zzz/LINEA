@@ -284,51 +284,133 @@ def _decode_hdf5_value(value: Any, arrays):
     return value
 
 
+def _write_hdf5_manifest(group, name, value, np, compress: bool, indent: int | None):
+    payload = json.dumps(value, indent=indent, ensure_ascii=True).encode("utf-8")
+    options = {}
+    if compress and payload:
+        options = {"compression": "gzip", "compression_opts": 4}
+    group.create_dataset(
+        name,
+        data=np.frombuffer(payload, dtype=np.uint8),
+        **options,
+    )
+
+
+class HDF5PredictionWriter:
+    """Incrementally write records without retaining their tensors in memory."""
+
+    def __init__(
+        self,
+        path: str | Path,
+        dataset_name: str,
+        codebase_name: str,
+        meta: dict[str, Any] | None = None,
+        summary: dict[str, Any] | None = None,
+        compress: bool | None = None,
+        indent: int | None = 2,
+    ) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.h5py, self.np = _require_hdf5()
+        self.use_compression = compress is not False
+        self.indent = indent
+        self.num_records = 0
+        self.closed = False
+        self.header = {
+            "format_name": FORMAT_NAME,
+            "format_version": FORMAT_VERSION,
+            "dataset_name": dataset_name,
+            "codebase_name": codebase_name,
+            "summary": {} if summary is None else dict(summary),
+            "meta": {} if meta is None else meta,
+        }
+
+        self.file = self.h5py.File(self.path, "w")
+        self.file.attrs["format_name"] = FORMAT_NAME
+        self.file.attrs["format_version"] = FORMAT_VERSION
+        self.file.attrs["hdf5_storage_version"] = HDF5_STORAGE_VERSION
+        self.records = self.file.create_group("records")
+
+    def append(self, record: PredictionRecord) -> None:
+        if self.closed:
+            raise RuntimeError("Cannot append to a closed HDF5 prediction writer.")
+        raw_record = {
+            "raw_data": record.raw_data,
+            "losses": record.losses,
+            "prediction": record.prediction,
+            "meta": record.meta,
+        }
+        if record.record_id is not None:
+            raw_record["id"] = record.record_id
+
+        record_group = self.records.create_group(f"{self.num_records:08d}")
+        record_arrays = record_group.create_group("arrays")
+        encoded = _encode_hdf5_value(
+            raw_record,
+            record_arrays,
+            count(),
+            self.np,
+            self.use_compression,
+        )
+        _write_hdf5_manifest(
+            record_group,
+            "manifest_json",
+            encoded,
+            self.np,
+            self.use_compression,
+            self.indent,
+        )
+        self.num_records += 1
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        try:
+            self.header["summary"].setdefault("num_records", self.num_records)
+            header_arrays = self.file.create_group("arrays")
+            encoded_header = _encode_hdf5_value(
+                self.header,
+                header_arrays,
+                count(),
+                self.np,
+                self.use_compression,
+            )
+            _write_hdf5_manifest(
+                self.file,
+                "header_json",
+                encoded_header,
+                self.np,
+                self.use_compression,
+                self.indent,
+            )
+        finally:
+            self.file.close()
+            self.closed = True
+
+    def __enter__(self) -> "HDF5PredictionWriter":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+
 def _save_hdf5(
     obj: PredictionFile,
     path: Path,
     compress: bool | None,
     indent: int | None,
 ) -> None:
-    h5py, np = _require_hdf5()
-    use_compression = compress is not False
-
-    def write_manifest(group, name, value):
-        payload = json.dumps(value, indent=indent, ensure_ascii=True).encode("utf-8")
-        options = {}
-        if use_compression and payload:
-            options = {"compression": "gzip", "compression_opts": 4}
-        group.create_dataset(
-            name,
-            data=np.frombuffer(payload, dtype=np.uint8),
-            **options,
-        )
-
-    with h5py.File(path, "w") as file:
-        file.attrs["format_name"] = obj.format_name
-        file.attrs["format_version"] = obj.format_version
-        file.attrs["hdf5_storage_version"] = HDF5_STORAGE_VERSION
-        raw_file = _raw_prediction_file_dict(obj)
-        raw_records = raw_file.pop("records")
-
-        header_arrays = file.create_group("arrays")
-        header = _encode_hdf5_value(
-            raw_file, header_arrays, count(), np, use_compression
-        )
-        write_manifest(file, "header_json", header)
-
-        records = file.create_group("records")
-        for index, raw_record in enumerate(raw_records):
-            record_group = records.create_group(f"{index:08d}")
-            record_arrays = record_group.create_group("arrays")
-            record = _encode_hdf5_value(
-                raw_record,
-                record_arrays,
-                count(),
-                np,
-                use_compression,
-            )
-            write_manifest(record_group, "manifest_json", record)
+    with HDF5PredictionWriter(
+        path,
+        dataset_name=obj.dataset_name,
+        codebase_name=obj.codebase_name,
+        meta=obj.meta,
+        summary=obj.summary,
+        compress=compress,
+        indent=indent,
+    ) as writer:
+        for record in obj.records:
+            writer.append(record)
 
 
 def _load_hdf5(path: Path) -> PredictionFile:

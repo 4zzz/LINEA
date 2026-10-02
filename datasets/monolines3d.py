@@ -408,7 +408,8 @@ class Monolines3D(torch.utils.data.Dataset):
         )
 
     def load_image(self, image_path):
-        return Image.open(str(image_path)).convert("RGB")
+        with Image.open(str(image_path)) as image:
+            return image.convert("RGB")
 
     def _invalid_line_reasons(self, line2d, line3d):
         reasons = []

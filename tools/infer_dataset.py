@@ -18,7 +18,13 @@ from tools.inference_cli import add_argument
 from tools.simple_prediction import build_simple_prediction, save_simple_prediction
 from util.git_utils import git_output, git_repository_root
 from util.line_model_export import save_line_model_glb
-from util.prediction_record import PredictionRecord, make_prediction_file, save, utc_timestamp
+from util.prediction_record import (
+    HDF5PredictionWriter,
+    PredictionRecord,
+    make_prediction_file,
+    save,
+    utc_timestamp,
+)
 from util.slconfig import DictAction
 from models.linea.matcher import build_matcher
 from models.linea.moge.utils.alignment import align_points_scale_xyz_shift, align_points_scale_z_shift
@@ -50,7 +56,14 @@ add_argument(parser, '--device', type=str, default='cuda')
 add_argument(parser, '--split', type=str, choices=('test', 'val', 'train'), default='test')
 add_argument(parser, '--batch-size', type=int, default=1)
 add_argument(parser, '--num-workers', type=int, default=1)
-add_argument(parser, '--model', type=str)
+add_argument(
+    parser,
+    '--checkpoint',
+    dest='checkpoint',
+    type=str,
+    required=True,
+    help='Checkpoint containing model weights.',
+)
 add_argument(parser, '--save-png-visualization', action='store_true', default=False)
 add_argument(parser, '-d', '--dont-save-sample', action='store_true', default=False)
 add_argument(parser, '-o', '--output-directory', type=str)
@@ -111,7 +124,7 @@ add_argument(
 if __name__ == '__main__':
     args = parser.parse_args()
 
-    checkpoint = torch.load(args.model, map_location="cpu", weights_only=False)
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model_args = checkpoint['args']
     training_output_dir = getattr(model_args, 'output_dir', None)
     model_args_overrides = args.set_model_args or {}
@@ -555,7 +568,7 @@ if __name__ == '__main__':
         },
         'export': {
             'created_at_utc': utc_timestamp(),
-            'weights_path': os.path.abspath(args.model),
+            'weights_path': os.path.abspath(args.checkpoint),
             'split': args.split,
             'fit_affine': args.fit_affine,
             'save_matching': save_matching,
@@ -575,7 +588,18 @@ if __name__ == '__main__':
 
     i = 0
     single_file_records = []
-    with torch.no_grad():
+    single_file_writer = None
+    if single_file_path is not None and single_file_path.suffix.lower() in {'.h5', '.hdf5'}:
+        single_file_writer = HDF5PredictionWriter(
+            single_file_path,
+            dataset_name=model_args.dataset_name,
+            codebase_name='LINEA',
+            meta=file_meta,
+        )
+
+    grad_enabled = torch.is_grad_enabled()
+    torch.set_grad_enabled(False)
+    try:
         for samples, targets in dataloader:
             if args.max_samples is not None and i >= args.max_samples:
                 break
@@ -609,7 +633,10 @@ if __name__ == '__main__':
                 alignment_info = None
 
             if args.save_png_visualization:
-                pil_imgs = [Image.open(tgt['image_path']).convert("RGB") for tgt in targets]
+                pil_imgs = []
+                for target in targets:
+                    with Image.open(target['image_path']) as image:
+                        pil_imgs.append(image.convert("RGB"))
                 vis = draw(pil_imgs, lines, scores, thrh=args.pred_threshold)
             else:
                 vis = None
@@ -645,7 +672,7 @@ if __name__ == '__main__':
                             'orig_size': targets[idx].get('orig_size'),
                         },
                         'model': {
-                            'weights_path': os.path.abspath(args.model),
+                            'weights_path': os.path.abspath(args.checkpoint),
                         },
                         'runtime': {
                             'device': args.device,
@@ -673,7 +700,10 @@ if __name__ == '__main__':
                         meta=record_meta,
                     )
                     if single_file_path is not None:
-                        single_file_records.append(record)
+                        if single_file_writer is not None:
+                            single_file_writer.append(record)
+                        else:
+                            single_file_records.append(record)
                         print('adding prediction data', i)
                     else:
                         prediction_file = make_prediction_file(
@@ -730,8 +760,12 @@ if __name__ == '__main__':
                     vis[idx].save(png_path)
 
                 i += 1
+    finally:
+        torch.set_grad_enabled(grad_enabled)
+        if single_file_writer is not None:
+            single_file_writer.close()
 
-    if single_file_path is not None:
+    if single_file_path is not None and single_file_writer is None:
         prediction_file = make_prediction_file(
             dataset_name=model_args.dataset_name,
             codebase_name='LINEA',

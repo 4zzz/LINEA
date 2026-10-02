@@ -73,7 +73,7 @@ def build_command(
     command = [
         python,
         str(REPO_ROOT / 'tools' / 'infer_dataset.py'),
-        '--model',
+        '--checkpoint',
         str(checkpoint),
         '--split',
         split,
