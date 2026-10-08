@@ -44,19 +44,23 @@ def _pad(data: bytes, padding: bytes) -> bytes:
 
 def save_line_model_glb(
     path: str | Path,
-    predicted_lines: Any,
+    predicted_lines3d: Any,
+    predicted_lines3d_fitted: Any,
     ground_truth_lines: Any | None = None,
     *,
     prediction_name: str = 'predictions',
 ) -> Path:
     """Save predicted and optional ground-truth segments as GLB edges."""
     path = Path(path)
-    predicted = _as_lines(predicted_lines)
+    predicted = _as_lines(predicted_lines3d)
+    predicted_fitted = _as_lines(predicted_lines3d_fitted) if predicted_lines3d_fitted is not None else None
     ground_truth = _as_lines(ground_truth_lines) if ground_truth_lines is not None else _as_lines([])
 
     groups = [
         (prediction_name, predicted, [1.0, 0.28, 0.05, 1.0]),
     ]
+    if predicted_fitted is not None:
+        groups.append(('predictions_fitted', predicted_fitted, [0.40, 0.75, 1.0, 1.0]))
     if ground_truth_lines is not None:
         groups.append(('ground_truth', ground_truth, [0.05, 0.75, 1.0, 1.0]))
 

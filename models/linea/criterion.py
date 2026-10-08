@@ -108,7 +108,7 @@ class LINEACriterion(nn.Module):
 
         return losses
 
-    def loss_lines3d(self, outputs, targets, indices, num_boxes):
+    def loss_lines3d(self, outputs, targets, indices, num_boxes, return_alignments=False):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
            targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
            The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
@@ -116,9 +116,11 @@ class LINEACriterion(nn.Module):
         assert 'pred_lines3d' in outputs
 
         losses_per_image = []
+        alignments = []
 
         for batch_i, ((src_idx, tgt_idx), target) in enumerate(zip(indices, targets)):
             if len(src_idx) == 0:
+                alignments.append(None)
                 continue
 
             src_lines3d = outputs['pred_lines3d'][batch_i, src_idx]   # [M, 6]
@@ -128,7 +130,13 @@ class LINEACriterion(nn.Module):
             src_pts = src_lines3d.view(-1, 2, 3)
             tgt_pts = tgt_lines3d.view(-1, 2, 3)
 
-            losses_per_image.append(self._aligned_lines3d_loss(src_pts, tgt_pts).sum())
+            losses, alignment = self._aligned_lines3d_loss(src_pts, tgt_pts)
+            losses_per_image.append(losses.sum())
+            if return_alignments:
+                alignments.append(alignment)
+
+        if return_alignments:
+            return alignments
 
         if len(losses_per_image) == 0:
             return {'loss_line3d': outputs['pred_lines3d'].sum() * 0.0}
@@ -180,7 +188,7 @@ class LINEACriterion(nn.Module):
         return torch.minimum(
             loss_direct.sum(dim=(1, 2)),
             loss_swapped.sum(dim=(1, 2)),
-        )
+        ), {'scale': scale, 'shift': shift}
 
     def _fit_line3d_alignment(self, src_pts, tgt_pts, weight):
         if self.line3d_alignment == 'xyz_shift':

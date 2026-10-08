@@ -6,29 +6,30 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import re
+from contextlib import ExitStack
 import sys
 from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
 import torch
-from PIL import Image, ImageDraw
-from torch import nn
+from PIL import Image
 from torch.utils.data import DataLoader, Dataset
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from datasets import BatchImageCollateFunction
-from tools.inference_cli import add_argument
-from tools.simple_prediction import build_simple_prediction, save_simple_prediction
-from util.git_utils import git_output, git_repository_root
-from util.line_model_export import save_line_model_glb
-from util.prediction_record import PredictionRecord, make_prediction_file, save, utc_timestamp
+from util.inference_cli import (
+    add_argument, add_data_loading_args, add_inference_option_args,
+    add_model_args, add_output_args, validate_output_args,
+)
+from util.inference_output_helpers import (
+    build_prediction_file_meta, create_inference_files, prediction_record_path,
+)
+from util.create_model import create_eval_model_from_checkpoint
 
 
 DEFAULT_OUTPUT_NAME = "predictions.json.gz"
@@ -261,7 +262,8 @@ class ImagePathDataset(Dataset):
 
     def __getitem__(self, index):
         path = self.paths[index]
-        image = Image.open(path).convert("RGB")
+        with Image.open(path) as source:
+            image = source.convert("RGB")
         width, height = image.size
         target = {
             "image_path": str(path),
@@ -277,121 +279,22 @@ class ImagePathDataset(Dataset):
         return image, target
 
 
-def _create_model(model_args):
-    from models.registry import MODULE_BUILD_FUNCS
-
-    class_module = getattr(model_args, "modelname")
-    if class_module not in MODULE_BUILD_FUNCS._module_dict:
-        raise ImageInferenceError(f"Unknown model module {class_module!r}.")
-    return MODULE_BUILD_FUNCS.get(class_module)(model_args)
-
-
-class InferenceModel(nn.Module):
-    def __init__(self, model, postprocessor):
-        super().__init__()
-        self.model = model.deploy()
-        self.postprocessor = postprocessor.deploy()
-
-    def forward(self, images, original_sizes, targets):
-        raw_outputs = self.model(images, targets)
-        lines, scores = self.postprocessor(raw_outputs, original_sizes)
-        return raw_outputs, lines, scores
-
-
-def _move_targets_to_device(targets, device):
-    return [{key: value.to(device) if torch.is_tensor(value) else value for key, value in target.items()} for target in targets]
-
-
-def _sample_raw_outputs(raw_outputs, index):
-    result = {}
-    for key, value in raw_outputs.items():
-        if "aux" in key or key == "dn_meta":
-            continue
-        result[key] = value[index] if torch.is_tensor(value) else value
-    return result
-
-
-def _build_prediction(raw_outputs, lines, scores, index, threshold):
-    sample_scores = scores[index]
-    keep = sample_scores > threshold
-    prediction = {
-        "lines2d": [
-            {"endpoints": lines[index][query], "score": sample_scores[query]}
-            for query in range(len(sample_scores))
-            if keep[query]
-        ]
-    }
-    if "pred_lines3d" in raw_outputs:
-        prediction["lines3d"] = [
-            {"endpoints": raw_outputs["pred_lines3d"][index][query], "score": sample_scores[query]}
-            for query in range(len(sample_scores))
-            if keep[query]
-        ]
-    if "pred_line_depths" in raw_outputs:
-        prediction["line_depths"] = [
-            {"depths": raw_outputs["pred_line_depths"][index][query], "score": sample_scores[query]}
-            for query in range(len(sample_scores))
-            if keep[query]
-        ]
-    return prediction
-
-
-def _draw_prediction(image_path, lines, scores, threshold):
-    image = Image.open(image_path).convert("RGB")
-    drawing = ImageDraw.Draw(image)
-    for line, score in zip(lines, scores):
-        if score <= threshold:
-            continue
-        endpoints = line.detach().cpu().tolist()
-        drawing.line(endpoints, fill="red", width=5)
-        drawing.text((endpoints[0], endpoints[1]), f"{score.item():.2f}", fill="blue")
-    return image
-
-
-git_root = git_repository_root(REPO_ROOT)
-
-
-def _git_output(*command):
-    return git_output(command, git_root)
-
-
 def make_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("images", nargs="*", type=Path, help="image paths")
-    add_argument(parser, "--checkpoint", required=True, type=Path)
+    add_model_args(parser)
+    add_data_loading_args(parser, include_split=False)
+    add_inference_option_args(parser)
+    add_output_args(parser, aliases={
+        '--prediction-record': ('--prediction-files',),
+        '--single-prediction-record': ('-p', '-o', '--single-prediction-file', '--output'),
+        '--glb-model': ('--glb-models',),
+        '--simple-json': ('--simple-json-files',),
+        '--lines-2d-png': ('--save-visualizations',),
+        '--prediction-record-save-exact-sample': ('--save-input',),
+    })
     add_argument(parser, "--image", nargs="+", action="append", type=Path, default=[])
     add_argument(parser, "--image-list", action="append", type=Path, default=[])
-    prediction_group = parser.add_mutually_exclusive_group()
-    add_argument(
-        prediction_group,
-        "--prediction-files",
-        action="store_true",
-        help="save prediction.json.gz in each numbered image directory",
-    )
-    add_argument(
-        prediction_group,
-        "-p",
-        "-o",
-        "--single-prediction-file",
-        "--output",
-        type=Path,
-        default=None,
-        help="save all image records into one JSON, JSON.GZ, or HDF5 file",
-    )
-    add_argument(parser, "--glb-models", action="store_true",
-                 help="save model.glb in each numbered image directory")
-    add_argument(
-        parser,
-        "--simple-json-files",
-        "--simple-json",
-        action="store_true",
-        help="save compact prediction.json files containing lines and scores",
-    )
-    add_argument(parser, "--output-dir", type=Path, default=None)
-    add_argument(parser, "--batch-size", type=int, default=1)
-    add_argument(parser, "--num-workers", type=int, default=0)
-    add_argument(parser, "--device", default="cuda")
-    add_argument(parser, "--pred-threshold", type=float, default=0.0)
     add_argument(parser, "--camera-k", nargs="+", type=float, default=None, metavar="VALUE")
     add_argument(parser, "--camera-k-json", type=Path, default=None)
     add_argument(
@@ -400,32 +303,77 @@ def make_parser():
         action="store_true",
         help="estimate missing camera intrinsics from EXIF metadata",
     )
-    add_argument(parser, "--save-visualizations", action="store_true")
     add_argument(parser, "--visualization-dir", type=Path, default=None)
-    add_argument(parser, "--save-input", action="store_true", help="include transformed image tensors in raw_data")
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = make_parser().parse_args(argv)
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = make_parser()
+    args = parser.parse_args(argv)
+    validate_output_args(parser, args)
     if args.batch_size < 1:
-        raise ImageInferenceError("--batch-size must be at least 1.")
-    if not (
-        args.prediction_files
-        or args.single_prediction_file
-        or args.glb_models
-        or args.simple_json_files
-        or args.save_visualizations
-    ):
-        raise ImageInferenceError(
-            "Select at least one output: --prediction-files, --single-prediction-file, "
-            "--simple-json, --glb-models, or --save-visualizations."
-        )
-    if (args.prediction_files or args.simple_json_files or args.glb_models) and args.output_dir is None:
-        raise ImageInferenceError(
-            "--output-dir is required with --prediction-files, --simple-json, or --glb-models."
+        parser.error('--batch-size must be at least 1.')
+    if args.num_workers < 0:
+        parser.error('--num-workers must be nonnegative.')
+    if args.prediction_record_save_matching or args.prediction_record_matching_top_k != 5:
+        parser.error('Matching options require ground-truth targets and are unavailable for explicit images.')
+    if args.visualization_dir is not None and not args.lines_2d_png:
+        parser.error('--visualization-dir requires --lines-2d-png.')
+    return args
+
+
+def create_image_inference_files(
+    *, args, file_meta, stack, image_index, batch_index,
+    samples, targets, raw_outputs, lines, scores,
+):
+    target = targets[batch_index]
+    image_path = Path(target['image_path'])
+    sample_directory = (
+        image_output_directory(args.output_dir, image_index, image_path)
+        if args.output_dir is not None else None
+    )
+    output_paths = {}
+    if args.simple_json:
+        path = sample_directory / 'prediction.json'
+        if args.prediction_record and prediction_record_path(
+            sample_directory / 'prediction', args.prediction_record_backend, per_sample=True,
+        ) == path:
+            path = sample_directory / 'prediction_simple.json'
+        output_paths['simple_json'] = path
+
+    if args.glb_model:
+        if 'pred_lines3d' not in raw_outputs:
+            raise ImageInferenceError('LINEA3D output does not contain pred_lines3d.')
+        output_paths['glb_model'] = sample_directory / 'model.glb'
+
+    if args.lines_2d_png:
+        output_paths['lines_2d_png'] = (
+            sample_directory / 'visualization.png' if args.visualization_dir is None else
+            args.visualization_dir / f'{image_index + 1:03d}-{image_path.stem}.png'
         )
 
+    return create_inference_files(
+        batch_index, image_index, raw_outputs, lines, scores, targets,
+        None, None, None, checkpoint=args.checkpoint, device=args.device,
+        dataset_name='images', split='image',
+        base_name_fn=lambda index, target: sample_directory / 'prediction' if sample_directory is not None else None,
+        output_paths=output_paths, pred_threshold=args.pred_threshold,
+        simple_json=args.simple_json, glb_model=args.glb_model, lines_2d_png=args.lines_2d_png,
+        prediction_record=args.prediction_record, single_prediction_record=args.single_prediction_record,
+        prediction_record_backend=args.prediction_record_backend,
+        prediction_record_save_exact_sample=args.prediction_record_save_exact_sample,
+        samples=samples, file_meta=file_meta, stack=stack,
+        line_depths=raw_outputs.get('pred_line_depths'), glb_prediction_name='predictions_raw',
+        record_meta={
+            'image_path': str(image_path), 'original_size': target['orig_size'],
+            'camera_K': target.get('camera_K'),
+            'camera_K_metadata': target.get('camera_K_metadata'),
+        },
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
     checkpoint_path = args.checkpoint.expanduser().resolve()
     if not checkpoint_path.is_file():
         raise ImageInferenceError(f"Checkpoint does not exist: {checkpoint_path}")
@@ -435,18 +383,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if shared_k is not None and camera_source is not None:
         raise ImageInferenceError("Use only one of --camera-k and --camera-k-json.")
 
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    model_args = checkpoint["args"]
-    if not hasattr(model_args, "linea3d"):
-        model_args.linea3d = False
-    if not hasattr(model_args, "line3d_pred_strategy"):
-        model_args.line3d_pred_strategy = "direct"
-    if args.glb_models and not model_args.linea3d:
-        raise ImageInferenceError("--glb-models requires a LINEA3D checkpoint.")
-    if str(getattr(model_args, "backbone", "")).startswith("HGNetv2"):
-        model_args.pretrained = False
-
-    needs_camera_k = model_args.linea3d and model_args.line3d_pred_strategy == "uv_depth"
+    inference_model, model_args, model_meta = create_eval_model_from_checkpoint(checkpoint_path, raw_outputs=True)
+    if args.glb_model and not model_args.linea3d:
+        raise ImageInferenceError('--glb-model requires a LINEA3D checkpoint.')
+    needs_camera_k = model_meta['needs_camera_k']
     camera_ks = []
     camera_metadata = []
     for path in image_paths:
@@ -476,16 +416,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--camera-k-from-exif when usable EXIF metadata is available."
         )
 
-    model, postprocessor = _create_model(model_args)
-    state = checkpoint["ema"]["module"] if "ema" in checkpoint else checkpoint["model"]
-    model.load_state_dict(state)
-
     device_name = args.device
     if device_name.startswith("cuda") and not torch.cuda.is_available():
         print("CUDA requested but unavailable; falling back to CPU.")
         device_name = "cpu"
     device = torch.device(device_name)
-    inference_model = InferenceModel(model, postprocessor).to(device).eval()
+    inference_model = inference_model.to(device).eval()
+    args.device = str(device)
+    args.checkpoint = checkpoint_path
 
     dataset = ImagePathDataset(image_paths, camera_ks, camera_metadata, _make_transform(model_args))
     eval_size = getattr(model_args, "eval_spatial_size", None)
@@ -500,135 +438,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         num_workers=args.num_workers,
     )
 
-    output_path = (
-        args.single_prediction_file.expanduser().resolve()
-        if args.single_prediction_file is not None else None
-    )
-    output_directory = (
-        args.output_dir.expanduser().resolve()
-        if args.output_dir is not None else default_output_directory(checkpoint_path).resolve()
-    )
-    visualization_dir = args.visualization_dir
-    if visualization_dir is None:
-        visualization_dir = output_directory
-    visualization_dir = visualization_dir.expanduser().resolve()
+    if args.output_dir is not None:
+        args.output_dir = args.output_dir.expanduser().resolve()
+    if args.single_prediction_record is not None:
+        args.single_prediction_record = args.single_prediction_record.expanduser().resolve()
+    if args.visualization_dir is not None:
+        args.visualization_dir = args.visualization_dir.expanduser().resolve()
 
-    file_meta = {
-        "codebase": {
-            "commit": _git_output("git", "rev-parse", "HEAD"),
-            "diff": _git_output("git", "diff", "HEAD"),
-        },
-        "export": {
-            "created_at_utc": utc_timestamp(),
-            "weights_path": os.path.abspath(checkpoint_path),
-            "device": str(device),
-            "prediction_threshold": args.pred_threshold,
-        },
-        "model": {
-            "training_dataset_name": getattr(model_args, "dataset_name", None),
-            "linea3d": bool(model_args.linea3d),
-            "line3d_pred_strategy": model_args.line3d_pred_strategy,
-        },
-    }
-    records = []
+    wants_records = args.prediction_record or args.single_prediction_record is not None
+    file_meta = None
+    if wants_records:
+        file_meta = build_prediction_file_meta(args, model_args, model_meta, REPO_ROOT, has_ground_truth=False)
+        file_meta['export'].update(device=str(device), prediction_threshold=args.pred_threshold)
+        file_meta['model'] = {
+            'training_dataset_name': getattr(model_args, 'dataset_name', None),
+            'linea3d': bool(model_args.linea3d),
+            'line3d_pred_strategy': model_args.line3d_pred_strategy,
+        }
+
     image_index = 0
-    with torch.no_grad():
+    with torch.no_grad(), ExitStack() as stack:
         for samples, targets in dataloader:
-            original_sizes = torch.stack([
-                target["orig_size"][[1, 0]] for target in targets
-            ]).to(device)
-            targets_device = _move_targets_to_device(targets, device)
-            raw_outputs, lines, scores = inference_model(samples.to(device), original_sizes, targets_device)
-
-            for batch_index, target in enumerate(targets):
-                image_path = Path(target["image_path"])
-                sample_directory = image_output_directory(
-                    output_directory, image_index, image_path
+            samples = samples.to(device)
+            targets = [{key: value.to(device) if torch.is_tensor(value) else value
+                        for key, value in target.items()} for target in targets]
+            original_sizes = torch.stack([target['orig_size'].flip(0) for target in targets])
+            raw_outputs, lines, scores = inference_model(samples, original_sizes, targets)
+            for batch_index in range(len(targets)):
+                create_image_inference_files(
+                    args=args, file_meta=file_meta, stack=stack,
+                    image_index=image_index, batch_index=batch_index, samples=samples,
+                    targets=targets, raw_outputs=raw_outputs, lines=lines, scores=scores,
                 )
-                if args.prediction_files or output_path is not None:
-                    record = PredictionRecord(
-                        record_id=f"image_{image_index:06d}",
-                        raw_data={
-                            "input": samples[batch_index] if args.save_input else {},
-                            "target": target,
-                            "output_raw": _sample_raw_outputs(raw_outputs, batch_index),
-                        },
-                        losses={},
-                        prediction=_build_prediction(
-                            raw_outputs, lines, scores, batch_index, args.pred_threshold
-                        ),
-                        meta={
-                            "image_path": str(image_path),
-                            "original_size": target["orig_size"],
-                            "camera_K": target.get("camera_K"),
-                            "camera_K_metadata": target.get("camera_K_metadata"),
-                        },
-                    )
-                    if args.prediction_files:
-                        prediction_file = make_prediction_file(
-                            dataset_name="images",
-                            codebase_name="LINEA",
-                            records=[record],
-                            meta=file_meta,
-                        )
-                        prediction_path = sample_directory / "prediction.json.gz"
-                        save(prediction_file, prediction_path)
-                        print(f"Saved prediction to {prediction_path}")
-                    else:
-                        records.append(record)
-
-                if args.glb_models:
-                    if "pred_lines3d" not in raw_outputs:
-                        raise ImageInferenceError(
-                            "LINEA3D output does not contain pred_lines3d."
-                        )
-                    keep = scores[batch_index] > args.pred_threshold
-                    model_path = sample_directory / "model.glb"
-                    save_line_model_glb(
-                        model_path,
-                        raw_outputs["pred_lines3d"][batch_index][keep],
-                        prediction_name="predictions_raw",
-                    )
-                    print(f"Saved 3D model to {model_path}")
-
-                if args.simple_json_files:
-                    simple_path = sample_directory / "prediction.json"
-                    simple_prediction = build_simple_prediction(
-                        lines,
-                        scores,
-                        batch_index,
-                        args.pred_threshold,
-                        raw_outputs=raw_outputs,
-                    )
-                    save_simple_prediction(simple_path, simple_prediction)
-                    print(f"Saved simple prediction to {simple_path}")
-
-                if args.save_visualizations:
-                    if args.visualization_dir is None:
-                        visualization_path = sample_directory / "visualization.png"
-                    else:
-                        visualization_path = (
-                            visualization_dir
-                            / f"{image_index + 1:03d}-{image_path.stem}.png"
-                        )
-                    visualization_path.parent.mkdir(parents=True, exist_ok=True)
-                    image = _draw_prediction(
-                        image_path, lines[batch_index], scores[batch_index], args.pred_threshold
-                    )
-                    image.save(visualization_path)
                 image_index += 1
+    if args.single_prediction_record is not None:
+        path = prediction_record_path(args.single_prediction_record, args.prediction_record_backend)
+        print(f'Saved {image_index} predictions to {path}')
 
-    if output_path is not None:
-        prediction_file = make_prediction_file(
-            dataset_name="images",
-            codebase_name="LINEA",
-            records=records,
-            meta=file_meta,
-        )
-        save(prediction_file, output_path)
-        print(f"Saved {len(records)} predictions to {output_path}")
-    if args.save_visualizations:
-        print(f"Saved visualizations to {visualization_dir}")
     return 0
 
 

@@ -33,6 +33,15 @@ def _unwrap_method(value: Any, method_name: str) -> Any:
     return value
 
 
+def _to_cpu(value: Any) -> Any:
+    """Detach nested tensor-like values without requiring a tensor library."""
+    if isinstance(value, dict):
+        return {key: _to_cpu(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_to_cpu(item) for item in value)
+    return _unwrap_method(_unwrap_method(value, "detach"), "cpu")
+
+
 def to_jsonable(value: Any) -> Any:
     """
     Recursively convert common Python / tensor / ndarray-like objects into a
@@ -86,11 +95,21 @@ def to_jsonable(value: Any) -> Any:
 
 @dataclass
 class PredictionRecord:
+    """A record whose initial tensor data is detached and stored on CPU."""
+
     raw_data: dict[str, Any] = field(default_factory=dict)
     losses: dict[str, Any] = field(default_factory=dict)
     prediction: dict[str, Any] = field(default_factory=dict)
     meta: dict[str, Any] = field(default_factory=dict)
     record_id: str | None = None
+
+    def __post_init__(self) -> None:
+        # Combined exporters retain records until saving; release their GPU
+        # storage and computation graphs as soon as each record is created.
+        self.raw_data = _to_cpu(self.raw_data)
+        self.losses = _to_cpu(self.losses)
+        self.prediction = _to_cpu(self.prediction)
+        self.meta = _to_cpu(self.meta)
 
     def to_dict(self) -> dict[str, Any]:
         data = {

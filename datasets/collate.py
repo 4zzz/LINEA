@@ -65,6 +65,7 @@ class BatchImageCollateFunction(BaseCollateFunction):
                     camera_k[1, 2] *= sz / original_h
                     target["camera_K"] = camera_k
                 target["size"] = torch.tensor([sz, sz])
+                target["image_size_before_padding"] = torch.tensor([sz, sz])
         else:
             max_h = max(img.shape[-2] for img in images)
             max_w = max(img.shape[-1] for img in images)
@@ -74,6 +75,7 @@ class BatchImageCollateFunction(BaseCollateFunction):
             target_w += (32 - target_w % 32) % 32
             for image, target in zip(images, targets):
                 original_h, original_w = image.shape[-2:]
+                target["image_size_before_padding"] = torch.tensor([original_h, original_w])
                 if "lines" in target:
                     line_scale = target["lines"].new_tensor([
                         original_w / target_w,

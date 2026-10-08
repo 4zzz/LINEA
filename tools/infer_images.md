@@ -9,8 +9,8 @@ Infer one image:
 venv314/bin/python tools/infer_images.py \
   --checkpoint output/experiment/checkpoint0009.pth \
   --image path/to/image.jpg \
-  --prediction-files \
-  --glb-models \
+  --prediction-record \
+  --glb-model \
   --output-dir output/image_inference
 ```
 
@@ -34,8 +34,8 @@ venv314/bin/python tools/infer_images.py \
   --checkpoint output/experiment/checkpoint0009.pth \
   --image first.jpg second.jpg \
   --image third.jpg \
-  --prediction-files \
-  --save-visualizations \
+  --prediction-record \
+  --lines-2d-png \
   --output-dir output/image_inference
 ```
 
@@ -46,10 +46,10 @@ files. Blank lines and lines starting with `#` are ignored:
 venv314/bin/python tools/infer_images.py \
   --checkpoint output/experiment/checkpoint0009.pth \
   --image-list images.txt \
-  --single-prediction-file selected_images.json.gz
+  --single-prediction-record selected_images.json.gz
 ```
 
-`--prediction-files` and `--single-prediction-file` are mutually exclusive.
+`--prediction-record` and `--single-prediction-record` are mutually exclusive.
 The former creates one directory per input image:
 
 ```text
@@ -64,14 +64,30 @@ output/image_inference/
     visualization.png
 ```
 
-`--prediction-files`, `--simple-json`, and `--glb-models` require
+`--prediction-record`, `--simple-json`, `--glb-model`, and `--lines-2d-png` require
 `--output-dir`. GLB models are available only for LINEA3D checkpoints. They
 contain thresholded predictions as native line-segment edges in the model's
 camera-coordinate space.
 
-The old `--output` spelling remains an alias for
-`--single-prediction-file`. Every long inference option accepts both hyphens
-and underscores, for example `--output-dir` and `--output_dir`.
+The script uses the same model, data-loading, inference, and output options as
+`infer_dataset.py`. Use `--prediction-record-backend json`, `json.gz`, or `h5`
+to select a record backend. Combined HDF5 files stream records to disk.
+`--prediction-record-save-exact-sample` includes the transformed and padded
+input tensor; it is omitted by default. Records preserve camera metadata,
+filtered line depths, and Git commit/diff metadata.
+
+The previous spellings remain aliases: `--prediction-files`,
+`--single-prediction-file` (also `--output`, `-p`, and `-o`), `--glb-models`,
+`--simple-json-files`, `--save-visualizations`, and `--save-input`.
+Every long option accepts both hyphens and underscores. PNG output now follows
+the shared validation and requires `--output-dir`, including when a custom
+`--visualization-dir` is supplied.
+
+Per-image record names default to `prediction.json.gz`. If JSON records and
+compact JSON are both selected, the compact output uses `prediction_simple.json`
+to avoid overwriting the record at `prediction.json`.
+Matching options are unavailable because explicit images have no ground-truth
+line targets. Image coordinates in PNG and JSON outputs account for input padding.
 
 ## Camera intrinsics
 

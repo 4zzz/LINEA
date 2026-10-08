@@ -4,7 +4,7 @@ from pathlib import Path
 import warnings
 import json
 import zipfile
-from typing import Tuple
+from typing import Tuple, List
 import numpy as np
 import numpy.typing as npt
 import torch
@@ -18,6 +18,10 @@ def save_json(file, data):
     f = open(file, "w")
     json.dump(data, f, indent = 6)
     f.close()
+
+DEFAULT_SCENE_IMAGES_DIR = "images"
+DEFAULT_SCENE_ANNOTATIONS_DIR = "limap_annotations"
+DEFAULT_SCENE_ANNOTATIONS_FILE = "limap_annotations.zip"
 
 class DirectoryAnnotationSource:
     def __init__(self, annotations_dir: Path):
@@ -49,8 +53,9 @@ class DirectoryAnnotationSource:
 
 
 class ZipAnnotationSource:
-    def __init__(self, zip_path: Path):
+    def __init__(self, zip_path: Path, scene_annotations_dir=DEFAULT_SCENE_ANNOTATIONS_DIR):
         self.zip_path = Path(zip_path)
+        self.scene_annotations_dir = scene_annotations_dir
 
     def info(self):
         return {
@@ -102,7 +107,7 @@ class ZipAnnotationSource:
 
         # Handle zips that contain:
         #   limap_annotations/foo.jpg.json
-        if len(parts) >= 2 and parts[0] == "limap_annotations":
+        if len(parts) >= 2 and parts[0] == self.scene_annotations_dir:
             path = Path(*parts[1:])
 
         # Safety / cleanup: ignore weird absolute or parent-relative paths
@@ -120,7 +125,11 @@ def build_args(parser, required=None):
         required_arg['required'] = required
 
     parser.add_argument('--mono3d_dataset_root', type=str, **required_arg)
+    parser.add_argument('--mono3d_single_scene_root', type=bool, default=False)
     parser.add_argument('--mono3d_preload_images', type=bool, default=False)
+    parser.add_argument('--mono3d_scene_images_dir', type=str, default=DEFAULT_SCENE_IMAGES_DIR)
+    parser.add_argument('--mono3d_scene_annotations_dir', type=str, default=DEFAULT_SCENE_ANNOTATIONS_DIR)
+    parser.add_argument('--mono3d_scene_annotations_file', type=str, default=DEFAULT_SCENE_ANNOTATIONS_FILE)
     parser.add_argument(
         '--mono3d_use_image_normalized_target_line_coords',
         action='store_true',
@@ -143,6 +152,7 @@ def build_args(parser, required=None):
     parser.add_argument('--mono3d_trim_3d_lines_to_2d', action='store_true', default=False)
     parser.add_argument('--mono3d_record_3d_line_trimming', action='store_true', default=False)
 
+
 class Monolines3D(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -154,6 +164,7 @@ class Monolines3D(torch.utils.data.Dataset):
         do_not_normalize_images,
         preload,
         strict,
+        single_scene_root=False,
         invalid_line_filter='none',
         invalid_line_min_depth=1e-6,
         invalid_line_min_length=1e-8,
@@ -162,6 +173,9 @@ class Monolines3D(torch.utils.data.Dataset):
         record_3d_line_trimming=False,
         transforms=None,
         experiment_dir=None,
+        scene_images_dir=DEFAULT_SCENE_IMAGES_DIR,
+        scene_annotations_dir=DEFAULT_SCENE_ANNOTATIONS_DIR,
+        scene_annotations_file=DEFAULT_SCENE_ANNOTATIONS_FILE,
     ):
         self.split = split
         self.train2d = train2d
@@ -182,10 +196,18 @@ class Monolines3D(torch.utils.data.Dataset):
         self.trim_3d_lines_to_2d = trim_3d_lines_to_2d
         self.record_3d_line_trimming = record_3d_line_trimming
 
-        dataset_root = Path(root_dir)
+        self.scene_images_dir = scene_images_dir
+        self.scene_annotations_dir = scene_annotations_dir
+        self.scene_annotations_file = scene_annotations_file
 
-        print("Looking for scenes in", dataset_root, "...")
-        self.scenes = self.find_scene_roots(dataset_root)
+        if not os.path.isdir(root_dir):
+            raise FileNotFoundError(f"Dataset root '{root_dir}' is not a directory.")
+
+        if single_scene_root:
+            self.scenes = [Path(root_dir)]
+        else:
+            print("Looking for scenes in '", root_dir, "'...")
+            self.scenes = self.find_scene_roots(root_dir)
 
         self.used_data = []
         self.entries = []
@@ -196,8 +218,8 @@ class Monolines3D(torch.utils.data.Dataset):
         sample_id_counter = 0
         for scene_root in self.scenes:
             print('Loading scene', scene_root)
-            images_dir = scene_root / "images"
-            annotations_dir = scene_root / "limap_annotations"
+            images_dir = scene_root / self.scene_images_dir
+            annotations_dir = scene_root / self.scene_annotations_dir
 
             if not images_dir.exists():
                 self._problem(f"Missing images dir: {images_dir}")
@@ -283,56 +305,62 @@ class Monolines3D(torch.utils.data.Dataset):
                 # resolve() is nice here because it also resolves images_dir symlink.
                 loadable_image_path = image_path.resolve()
 
+                entry = {
+                    "sample_id": sample_id_counter,
+                    "image_path": str(loadable_image_path),
+                }
+
                 try:
-                    lines2d, lines3d, camera_K, filtering, trimming = self.resolve_target_lines(annotation)
+                    lines2d, lines3d, filtering, trimming = self.resolve_target_lines(annotation)
+
+                    if filtering['skipped_lines']:
+                        filtered_view = {
+                            "annotation": str(rel_annotation_path),
+                            "image": str(rel_image_path),
+                            **filtering,
+                        }
+                        scene_info["filtered_lines"].append(filtered_view)
+                        summary = scene_info["line_filtering"]["summary"]
+                        summary["affected_views"] += 1
+                        summary["skipped_lines"] += filtering['removed_line_count']
+                        summary["skipped_views"] += int(filtering['sample_skipped'])
+
+                    if self.trim_3d_lines_to_2d:
+                        summary = scene_info["line_trimming"]["summary"]
+                        summary["trimmed_lines"] += trimming['trimmed_line_count']
+                        summary["unchanged_lines"] += trimming['unchanged_line_count']
+                        summary["untrimmable_lines"] += trimming['untrimmable_line_count']
+
+                    if trimming['trimmed_line_count'] or trimming['untrimmable_line_count']:
+                        trimmed_view = {
+                            "annotation": str(rel_annotation_path),
+                            "image": str(rel_image_path),
+                            "trimmed_line_count": trimming['trimmed_line_count'],
+                            "unchanged_line_count": trimming['unchanged_line_count'],
+                            "untrimmable_line_count": trimming['untrimmable_line_count'],
+                        }
+                        if self.record_3d_line_trimming:
+                            trimmed_view["lines"] = trimming['lines']
+                        scene_info["trimmed_lines"].append(trimmed_view)
+                        summary = scene_info["line_trimming"]["summary"]
+                        summary["affected_views"] += 1
+
+                    if filtering['sample_skipped']:
+                        continue
+
+                    entry['target_lines2d'] = lines2d
+                    entry['target_lines3d'] = lines3d
                 except Exception as e:
                     msg = f"Could not resolve line targets for {image_path} ({e})"
                     scene_info["bad_annotations"].append(str(rel_annotation_path))
                     self._problem(msg)
-                    continue
 
-                if filtering['skipped_lines']:
-                    filtered_view = {
-                        "annotation": str(rel_annotation_path),
-                        "image": str(rel_image_path),
-                        **filtering,
-                    }
-                    scene_info["filtered_lines"].append(filtered_view)
-                    summary = scene_info["line_filtering"]["summary"]
-                    summary["affected_views"] += 1
-                    summary["skipped_lines"] += filtering['removed_line_count']
-                    summary["skipped_views"] += int(filtering['sample_skipped'])
-
-                if self.trim_3d_lines_to_2d:
-                    summary = scene_info["line_trimming"]["summary"]
-                    summary["trimmed_lines"] += trimming['trimmed_line_count']
-                    summary["unchanged_lines"] += trimming['unchanged_line_count']
-                    summary["untrimmable_lines"] += trimming['untrimmable_line_count']
-
-                if trimming['trimmed_line_count'] or trimming['untrimmable_line_count']:
-                    trimmed_view = {
-                        "annotation": str(rel_annotation_path),
-                        "image": str(rel_image_path),
-                        "trimmed_line_count": trimming['trimmed_line_count'],
-                        "unchanged_line_count": trimming['unchanged_line_count'],
-                        "untrimmable_line_count": trimming['untrimmable_line_count'],
-                    }
-                    if self.record_3d_line_trimming:
-                        trimmed_view["lines"] = trimming['lines']
-                    scene_info["trimmed_lines"].append(trimmed_view)
-                    summary = scene_info["line_trimming"]["summary"]
-                    summary["affected_views"] += 1
-
-                if filtering['sample_skipped']:
-                    continue
-
-                entry = {
-                    "sample_id": sample_id_counter,
-                    "image_path": str(loadable_image_path),
-                    "target_lines2d": lines2d,
-                    "target_lines3d": lines3d,
-                    "camera_K": camera_K,
-                }
+                try:
+                    entry['camera_K'] = self.resolve_target_camera(annotation)
+                except Exception as e:
+                    msg = f"Could not resolve target camera for {image_path} ({e})"
+                    scene_info["bad_annotations"].append(str(rel_annotation_path))
+                    self._problem(msg)
 
                 if self.preload:
                     print('Preloading image', loadable_image_path)
@@ -361,7 +389,8 @@ class Monolines3D(torch.utils.data.Dataset):
             }
             print('Normalizing lines...')
             for i in range(len(self.entries)):
-                self.entries[i]['target_lines3d'] = self.normalize_lines(self.entries[i]['target_lines3d'], std, mean).numpy()
+                if 'target_lines3d' in self.entries[i]:
+                    self.entries[i]['target_lines3d'] = self.normalize_lines(self.entries[i]['target_lines3d'], std, mean).numpy()
 
         if experiment_dir is not None and os.path.isdir(experiment_dir):
             path = os.path.join(experiment_dir, f'scene_info_{split}.json')
@@ -382,6 +411,8 @@ class Monolines3D(torch.utils.data.Dataset):
     def line_space_normalization_constants(self):
         endpoints = []
         for entry in self.entries:
+            if 'target_lines3d' not in entry:
+                continue
             lines = entry['target_lines3d']
             for line in lines:
                 #print(line.shape)
@@ -394,17 +425,17 @@ class Monolines3D(torch.utils.data.Dataset):
         return mean, std
 
     def _get_annotation_source(self, scene_root: Path):
-        zip_path = scene_root / "limap_annotations.zip"
-        annotations_dir = scene_root / "limap_annotations"
+        zip_path = scene_root / self.scene_annotations_file
+        annotations_dir = scene_root / self.scene_annotations_dir
 
         if zip_path.is_file():
-            return ZipAnnotationSource(zip_path)
+            return ZipAnnotationSource(zip_path, scene_annotations_dir=self.scene_annotations_dir)
 
         if annotations_dir.is_dir():
             return DirectoryAnnotationSource(annotations_dir)
 
         raise FileNotFoundError(
-            f"Scene has neither limap_annotations.zip nor limap_annotations directory: {scene_root}"
+            f"Scene has neither '{self.scene_annotations_file}' nor '{self.scene_annotations_dir}' directory: {scene_root}"
         )
 
     def load_image(self, image_path):
@@ -509,6 +540,13 @@ class Monolines3D(torch.utils.data.Dataset):
             "endpoint_reprojection_distances": endpoint_errors.tolist(),
         }
 
+    def resolve_target_camera(
+            self,
+            annotation,
+        ):
+        camera_K = np.array(annotation['camera']['K'], dtype=np.float32)
+        return camera_K
+
     def resolve_target_lines(
         self,
         annotation,
@@ -595,7 +633,6 @@ class Monolines3D(torch.utils.data.Dataset):
             return (
                 np.asarray(lines2d, dtype=np.float32).reshape(-1, 4),
                 np.asarray(lines3d, dtype=np.float32).reshape(-1, 6),
-                camera_K,
                 filtering,
                 trimming,
             )
@@ -614,15 +651,18 @@ class Monolines3D(torch.utils.data.Dataset):
 
         w, h = img.size
         target = {}
-        lines2d = entry['target_lines2d'].reshape(-1, 4)
-        lines3d = entry['target_lines3d'].reshape(-1, 6)
-        target['image_id'] = np.array([entry['sample_id']])
+        lines2d = entry['target_lines2d'].reshape(-1, 4) if 'target_lines2d' in entry else np.empty((0, 4), dtype=np.float32)
         target['labels'] = np.array([0 for _ in lines2d], dtype=np.int64)
         target['area'] = np.array([1 for _ in lines2d])
         target['iscrowd'] = np.array([0 for _ in lines2d])
         target['lines'] = lines2d.astype(np.float32)
+        lines3d = entry['target_lines3d'].reshape(-1, 6) if 'target_lines3d' in entry else np.empty((0, 6), dtype=np.float32)
         target['lines3d'] = lines3d.astype(np.float32)
-        target['camera_K'] = entry['camera_K'].astype(np.float32)
+
+        if 'camera_K' in entry:
+            target['camera_K'] = entry['camera_K'].astype(np.float32)
+        
+        target['image_id'] = np.array([entry['sample_id']])
         target['orig_size'] = np.array([h, w])
         target['size'] = np.array([h, w])
 
@@ -637,10 +677,8 @@ class Monolines3D(torch.utils.data.Dataset):
         return img, target
 
     def find_scene_roots(self, dataset_root: str | Path) -> list[Path]:
-        dataset_root = Path(dataset_root)
-
         scene_roots = []
-
+        dataset_root = Path(dataset_root)
         for dirpath, dirnames, filenames in os.walk(dataset_root):
             if ".scene_root" in filenames:
                 print("Found scene at:", dirpath)
@@ -696,7 +734,6 @@ def make_coco_transforms(image_set, args=None):
         if scales is None:
             return normalize
         else:
-
             max_size = args.data_aug_max_size
             return T.Compose([T.RandomResize(scales, max_size=max_size), normalize])
 
@@ -742,6 +779,10 @@ def build_mono3d_from_args(image_set, args, experiment_dir=None):
 
     conf = {
         "root_dir": args.mono3d_dataset_root,
+        "single_scene_root": getattr(args, 'mono3d_single_scene_root', False),
+        "scene_images_dir": getattr(args, 'mono3d_scene_images_dir', DEFAULT_SCENE_IMAGES_DIR),
+        "scene_annotations_dir": getattr(args, 'mono3d_scene_annotations_dir', DEFAULT_SCENE_ANNOTATIONS_DIR),
+        "scene_annotations_file": getattr(args, 'mono3d_scene_annotations_file', DEFAULT_SCENE_ANNOTATIONS_FILE),
         "split": image_set,
         "train2d": args.mono3d_train2d,
         "use_image_normalized_target_line_coords": args.mono3d_use_image_normalized_target_line_coords,

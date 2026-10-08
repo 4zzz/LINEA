@@ -67,20 +67,31 @@ class PostProcess(nn.Module):
         self.deploy_mode = False
 
     @torch.no_grad()
-    def forward(self, outputs, target_sizes):
+    def forward(self, outputs, target_sizes, *, image_sizes=None, padded_sizes=None):
         """ Perform the computation
         Parameters:
             outputs: raw outputs of the model
             target_sizes: tensor of dimension [batch_size x 2] containing the size of each images of the batch
                           For evaluation, this must be the original image size (before any data augmentation)
                           For visualization, this should be the image size after data augment, but before padding
+            image_sizes: optional [batch_size x 2] unpadded input sizes in (width, height) order
+            padded_sizes: optional [batch_size x 2] model input sizes in (width, height) order
+                          Supply both when predictions are normalized to the padded canvas.
         """
         out_logits, out_line = outputs['pred_logits'], outputs['pred_lines']
 
         scores = out_logits[..., 0].sigmoid()
 
-        # convert to [x0, y0, x1, y1] format
-        lines = out_line * target_sizes.repeat(1, 2).unsqueeze(1)
+        if (image_sizes is None) != (padded_sizes is None):
+            raise ValueError("image_sizes and padded_sizes must be supplied together")
+        scale = target_sizes.to(device=out_line.device, dtype=out_line.dtype)
+        if image_sizes is not None:
+            image_sizes = image_sizes.to(device=out_line.device, dtype=out_line.dtype)
+            padded_sizes = padded_sizes.to(device=out_line.device, dtype=out_line.dtype)
+            scale = scale * (padded_sizes / image_sizes)
+
+        # Convert padded-canvas coordinates to pixels in the requested image.
+        lines = out_line * scale.repeat(1, 2).unsqueeze(1)
 
         if self.deploy_mode:
             return lines, scores
