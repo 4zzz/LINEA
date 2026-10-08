@@ -9,3 +9,4 @@ addict
 yapf
 pycocotools
 opencv-python
+open3d
